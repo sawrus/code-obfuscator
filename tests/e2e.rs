@@ -185,8 +185,8 @@ impl RuntimeCheck {
                 }
             }
             RuntimeCheck::CSharp => {
-                if has_cmd("dotnet") {
-                    run_success(ProcessCommand::new("dotnet").arg("script").arg(file));
+                if has_cmd("dotnet-script") {
+                    run_success(ProcessCommand::new("dotnet-script").arg(file));
                 } else if has_cmd("csc") {
                     let out = file.parent().expect("dir").join("Program.exe");
                     run_success(
@@ -194,6 +194,9 @@ impl RuntimeCheck {
                             .arg(file)
                             .arg(format!("/out:{}", out.display())),
                     );
+                } else if has_cmd("dotnet") {
+                    // dotnet is present but neither dotnet-script nor csc are available;
+                    // skip execution to avoid false negatives in constrained environments.
                 }
             }
             RuntimeCheck::Cpp => {

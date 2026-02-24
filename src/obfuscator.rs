@@ -42,8 +42,12 @@ fn apply_rules(text: &str, map: &BTreeMap<String, String>, lang: Language) -> St
             let token = &text[start..i];
             if is_reserved_identifier(token)
                 || is_python_snake_case_identifier(token, lang)
+                || is_python_lowercase_identifier(token, lang)
+                || is_javascript_camel_case_identifier(token, lang)
                 || is_named_arg_label(text, start, i, lang)
+                || is_python_import_line(text, start, lang)
                 || is_python_import_path_token(text, start, i, lang)
+                || is_member_access_identifier(text, start, i)
             {
                 out.push_str(token);
             } else {
@@ -150,6 +154,7 @@ fn is_reserved_identifier(token: &str) -> bool {
                 | "std"
                 | "cout"
                 | "endl"
+                | "main"
                 | "Main"
                 | "Program"
                 | "String"
@@ -166,6 +171,36 @@ fn is_python_snake_case_identifier(token: &str, lang: Language) -> bool {
     matches!(lang, Language::Python) && token.contains('_')
 }
 
+fn is_python_lowercase_identifier(token: &str, lang: Language) -> bool {
+    matches!(lang, Language::Python) && token.chars().all(|c| c == '_' || c.is_ascii_lowercase())
+}
+
+fn is_javascript_camel_case_identifier(token: &str, lang: Language) -> bool {
+    if !matches!(lang, Language::JavaScript | Language::TypeScript) {
+        return false;
+    }
+    token.chars().any(|c| c.is_ascii_uppercase())
+}
+
+fn is_member_access_identifier(text: &str, start: usize, end: usize) -> bool {
+    let prev = text[..start].chars().rev().find(|c| !c.is_whitespace());
+    let rest = text[end..].trim_start();
+    matches!(prev, Some('.' | ':' | '#')) || rest.starts_with('.') || rest.starts_with("::")
+}
+
+fn is_python_import_line(text: &str, start: usize, lang: Language) -> bool {
+    if !matches!(lang, Language::Python) {
+        return false;
+    }
+    let line_start = text[..start].rfind('\n').map(|x| x + 1).unwrap_or(0);
+    let line_end = text[start..]
+        .find('\n')
+        .map(|x| start + x)
+        .unwrap_or(text.len());
+    let line = &text[line_start..line_end];
+    let trimmed = line.trim_start();
+    trimmed.starts_with("from ") || trimmed.starts_with("import ")
+}
 fn is_python_import_path_token(text: &str, start: usize, end: usize, lang: Language) -> bool {
     if !matches!(lang, Language::Python) {
         return false;

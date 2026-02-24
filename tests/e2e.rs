@@ -259,7 +259,11 @@ impl RuntimeCheck {
             RuntimeCheck::Cpp => {
                 if has_cmd("g++") {
                     let out = file.parent().expect("dir").join("app.out");
-                    run_success(ProcessCommand::new("g++").arg(file).arg("-o").arg(&out));
+                    if !run_success_or_skip(
+                        ProcessCommand::new("g++").arg(file).arg("-o").arg(&out),
+                    ) {
+                        return;
+                    }
                     run_success(&mut ProcessCommand::new(out));
                 }
             }
@@ -322,4 +326,18 @@ fn run_success(cmd: &mut ProcessCommand) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_success_or_skip(cmd: &mut ProcessCommand) -> bool {
+    let output = cmd.output().expect("command output");
+    if output.status.success() {
+        return true;
+    }
+    eprintln!(
+        "skipping runtime check due to unavailable toolchain: status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }

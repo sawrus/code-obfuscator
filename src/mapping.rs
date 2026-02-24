@@ -94,6 +94,10 @@ fn is_reserved_identifier(_lang: crate::language::Language, s: &str) -> bool {
                 | "Program"
                 | "String"
                 | "args"
+                | "str"
+                | "string"
+                | "std"
+                | "echo"
         )
 }
 
@@ -357,7 +361,6 @@ mod tests {
         .expect("terms");
         assert!(terms.contains("CustomerName"));
         assert!(terms.contains("comment"));
-        assert!(terms.contains("string"));
     }
 
     #[test]
@@ -380,13 +383,14 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("Alpha".to_string(), "Go".to_string());
         let terms = BTreeSet::from(["Beta".to_string(), "Gamma".to_string()]);
-        enrich_with_random(&mut map, &terms, Some(42));
+        let files: Vec<FileEntry> = Vec::new();
+        enrich_with_random(&mut map, &terms, &files, Some(42));
 
         let reverse = invert(&map).expect("invert");
         for (from, to) in &map {
             assert_eq!(reverse.get(to), Some(from));
         }
-    }    
+    }
 
     #[test]
     fn avoids_namespace_collisions_and_entrypoints() {

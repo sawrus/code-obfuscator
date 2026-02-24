@@ -386,6 +386,7 @@ mod tests {
         for (from, to) in &map {
             assert_eq!(reverse.get(to), Some(from));
         }
+    }    
 
     #[test]
     fn avoids_namespace_collisions_and_entrypoints() {

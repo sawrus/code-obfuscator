@@ -508,4 +508,40 @@ mod tests {
             "SELECT r.a1, b1, c1 FROM test666 r WHERE r.a1 > 0"
         );
     }
+
+    #[test]
+    fn deep_obfuscation_replacements_work_across_non_python_languages() {
+        let mut map = BTreeMap::new();
+        map.insert("refill_action".into(), "r1".into());
+        map.insert("user_id".into(), "u1".into());
+
+        let files = vec![
+            FileEntry {
+                rel: "main.js".into(),
+                text: "function refill_action(user_id) { return user_id + 1; }".into(),
+            },
+            FileEntry {
+                rel: "main.ts".into(),
+                text: "function refill_action(user_id: number): number { return user_id + 1; }"
+                    .into(),
+            },
+            FileEntry {
+                rel: "Main.java".into(),
+                text: "class Main { int refill_action(int user_id) { return user_id + 1; } }"
+                    .into(),
+            },
+            FileEntry {
+                rel: "main.go".into(),
+                text: "func refill_action(user_id int) int { return user_id + 1 }".into(),
+            },
+        ];
+
+        let out = transform_files(&files, &map).expect("transform");
+        for (_, transformed) in out {
+            assert!(transformed.contains("r1"));
+            assert!(transformed.contains("u1"));
+            assert!(!transformed.contains("refill_action"));
+            assert!(!transformed.contains("user_id"));
+        }
+    }
 }

@@ -252,6 +252,107 @@ class Falcon8382(User):
     assert!(!py.contains("Amber2096"));
 }
 
+#[test]
+fn e2e_deep_obfuscation_mapping_for_other_languages() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+
+    let fixtures = [
+        (
+            "javascript/main.js",
+            "function refill_action(user_id) { return user_id + 1; }
+",
+        ),
+        (
+            "typescript/main.ts",
+            "function refill_action(user_id: number): number { return user_id + 1; }
+",
+        ),
+        (
+            "java/Main.java",
+            "class Main { int refill_action(int user_id) { return user_id + 1; } }
+",
+        ),
+        (
+            "csharp/Program.cs",
+            "class Program { static int refill_action(int user_id) { return user_id + 1; } }
+",
+        ),
+        (
+            "cpp/main.cpp",
+            "int refill_action(int user_id) { return user_id + 1; }
+",
+        ),
+        (
+            "go/main.go",
+            "func refill_action(user_id int) int { return user_id + 1 }
+",
+        ),
+        (
+            "rust/main.rs",
+            "fn refill_action(user_id: i32) -> i32 { user_id + 1 }
+",
+        ),
+        (
+            "bash/main.sh",
+            "refill_action() { user_id=1; echo $user_id; }
+",
+        ),
+    ];
+
+    for (rel, body) in fixtures {
+        let target = src.path().join(rel);
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        fs::write(target, body).expect("write fixture");
+    }
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(&mapping, r#"{"refill_action":"r1","user_id":"u1"}"#).expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let checks = [
+        "javascript/main.js",
+        "typescript/main.ts",
+        "java/Main.java",
+        "csharp/Program.cs",
+        "cpp/main.cpp",
+        "go/main.go",
+        "rust/main.rs",
+        "bash/main.sh",
+    ];
+
+    for rel in checks {
+        let out = fs::read_to_string(obf.path().join(rel)).expect("read output");
+        assert!(
+            out.contains("r1"),
+            "expected mapped function in {rel}: {out}"
+        );
+        assert!(
+            out.contains("u1"),
+            "expected mapped variable in {rel}: {out}"
+        );
+        assert!(
+            !out.contains("refill_action"),
+            "source function leaked in {rel}: {out}"
+        );
+        assert!(
+            !out.contains("user_id"),
+            "source variable leaked in {rel}: {out}"
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LanguageCase {
     folder: &'static str,

@@ -4,12 +4,11 @@ use std::path::Path;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::FileEntry;
-use crate::language::{detect_language, is_keyword};
+use crate::language::{Language, detect_language, is_keyword, is_protected_identifier};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MappingFile {
@@ -57,26 +56,140 @@ fn err_dup(v: &str) -> AppResult<BTreeMap<String, String>> {
 
 pub fn detect_terms(files: &[FileEntry]) -> AppResult<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    let re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")?;
     for file in files {
         let lang = detect_language(&file.rel, &file.text);
-        collect_terms(&re, &file.text, lang, &mut out);
+        collect_terms(&file.text, lang, &mut out);
     }
     Ok(out)
 }
 
-fn collect_terms(
-    re: &Regex,
-    text: &str,
-    lang: crate::language::Language,
-    out: &mut BTreeSet<String>,
-) {
-    for m in re.find_iter(text) {
-        let s = m.as_str();
-        if !is_keyword(lang, s) {
-            out.insert(s.to_string());
+fn collect_terms(text: &str, lang: Language, out: &mut BTreeSet<String>) {
+    let mut token = String::new();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut string_delim: Option<char> = None;
+    let mut escape = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if string_delim.is_some() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if Some(ch) == string_delim {
+                string_delim = None;
+            }
+            continue;
+        }
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && chars.peek().copied() == Some('/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if starts_line_comment(lang, ch, chars.peek().copied()) {
+            flush_term(&mut token, lang, out);
+            chars.next();
+            in_line_comment = true;
+            continue;
+        }
+        if starts_block_comment(lang, ch, chars.peek().copied()) {
+            flush_term(&mut token, lang, out);
+            chars.next();
+            in_block_comment = true;
+            continue;
+        }
+        if is_hash_comment(lang, ch) {
+            flush_term(&mut token, lang, out);
+            in_line_comment = true;
+            continue;
+        }
+        if is_string_delim(ch) {
+            flush_term(&mut token, lang, out);
+            string_delim = Some(ch);
+            continue;
+        }
+
+        if is_ident_char(ch) {
+            token.push(ch);
+        } else {
+            flush_term(&mut token, lang, out);
         }
     }
+    flush_term(&mut token, lang, out);
+}
+
+fn flush_term(token: &mut String, lang: Language, out: &mut BTreeSet<String>) {
+    if token.len() < 3 {
+        token.clear();
+        return;
+    }
+    if !token
+        .chars()
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+    {
+        token.clear();
+        return;
+    }
+    if !is_keyword(lang, token) && !is_protected_identifier(lang, token) {
+        out.insert(token.clone());
+    }
+    token.clear();
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn starts_line_comment(lang: Language, ch: char, peek: Option<char>) -> bool {
+    matches!(
+        lang,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Java
+            | Language::CSharp
+            | Language::CCpp
+            | Language::Go
+            | Language::Rust
+    ) && ch == '/'
+        && peek == Some('/')
+}
+
+fn starts_block_comment(lang: Language, ch: char, peek: Option<char>) -> bool {
+    matches!(
+        lang,
+        Language::JavaScript
+            | Language::TypeScript
+            | Language::Java
+            | Language::CSharp
+            | Language::CCpp
+            | Language::Go
+            | Language::Rust
+            | Language::Sql
+    ) && ch == '/'
+        && peek == Some('*')
+}
+
+fn is_hash_comment(lang: Language, ch: char) -> bool {
+    matches!(lang, Language::Python | Language::Bash | Language::Sql) && ch == '#'
+}
+
+fn is_string_delim(ch: char) -> bool {
+    ch == '\'' || ch == '"'
 }
 
 pub fn enrich_with_random(
@@ -213,7 +326,7 @@ mod tests {
                 "a.go",
                 "func BuildReport() { var customerId int }",
                 "func",
-                "BuildReport",
+                "customerId",
             ),
             (
                 "a.rs",
@@ -250,14 +363,26 @@ mod tests {
     }
 
     #[test]
-    fn keeps_strings_and_comments_tokens_for_obfuscation() {
+    fn skips_strings_and_comments_when_detecting_terms() {
         let terms = detect_terms(&[FileEntry {
             rel: "main.py".into(),
             text: "# CustomerName comment\ntext = \"CustomerName in string\"\n".into(),
         }])
         .expect("terms");
-        assert!(terms.contains("CustomerName"));
-        assert!(terms.contains("comment"));
-        assert!(terms.contains("string"));
+        assert!(!terms.contains("CustomerName"));
+        assert!(!terms.contains("comment"));
+        assert!(!terms.contains("string"));
+    }
+
+    #[test]
+    fn skips_python_dunder_tokens() {
+        let terms = detect_terms(&[FileEntry {
+            rel: "main.py".into(),
+            text: "if __name__ == \"__main__\":\n    run_workers()".into(),
+        }])
+        .expect("terms");
+        assert!(!terms.contains("__name__"));
+        assert!(!terms.contains("__main__"));
+        assert!(terms.contains("run_workers"));
     }
 }

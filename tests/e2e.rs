@@ -104,6 +104,11 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
         .arg("42");
     forward.assert().success();
 
+    for case in &languages {
+        case.runtime
+            .run_if_available(&obf.path().join(case.folder).join(case.file));
+    }
+
     let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
     reverse
         .arg("--mode")
@@ -123,6 +128,34 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
 
         case.runtime
             .run_if_available(&rev.path().join(case.folder).join(case.file));
+    }
+}
+
+#[test]
+fn python_dunder_and_named_arg_stays_executable_after_obfuscation() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+    let file = src.path().join("main.py");
+    fs::write(
+        &file,
+        "def run_workers(items, sleep_seconds):\n    print(len(items), sleep_seconds)\n\nclass ChargedMwlUserRule1Worker:\n    pass\n\nif __name__ == \"__main__\":\n    run_workers([ChargedMwlUserRule1Worker()], sleep_seconds=10)\n",
+    )
+    .expect("write");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--seed")
+        .arg("42");
+    forward.assert().success();
+
+    if has_cmd("python3") {
+        run_success(ProcessCommand::new("python3").arg(obf.path().join("main.py")));
     }
 }
 

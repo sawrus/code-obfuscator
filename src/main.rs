@@ -94,7 +94,7 @@ fn reverse(args: &Args) -> AppResult<()> {
     let path = input_map_path(args)?;
     let map_file = load_mapping(&path)?;
     let files = fs_ops::read_text_tree(&args.source)?;
-    let transformed = obfuscator::transform_files(&files, &map_file.reverse)?;
+    let transformed = obfuscator::transform_files_with_options(&files, &map_file.reverse, false)?;
     fs_ops::write_text_tree(&args.target, &transformed)?;
     print_stats(files.len(), &map_file.reverse, &path);
     Ok(())

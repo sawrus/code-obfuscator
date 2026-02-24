@@ -42,6 +42,48 @@ pub fn is_keyword(lang: Language, s: &str) -> bool {
     keywords(lang).contains(&s) || keywords(lang).contains(&s.to_ascii_lowercase().as_str())
 }
 
+pub fn is_protected_identifier(lang: Language, s: &str) -> bool {
+    let common = ["main", "__name__", "__main__"];
+    if common.contains(&s) {
+        return true;
+    }
+    if is_builtin(lang, s) {
+        return true;
+    }
+    match lang {
+        Language::Python => s.starts_with("__") && s.ends_with("__"),
+        Language::Go => s.chars().next().is_some_and(char::is_uppercase),
+        _ => false,
+    }
+}
+
+fn is_builtin(lang: Language, s: &str) -> bool {
+    match lang {
+        Language::Python => [
+            "print", "len", "range", "str", "int", "float", "list", "dict", "set", "tuple", "bool",
+        ]
+        .contains(&s),
+        Language::JavaScript | Language::TypeScript => {
+            ["console", "log", "require", "module", "exports"].contains(&s)
+        }
+        Language::Java => ["System", "out", "println", "String"].contains(&s),
+        Language::CSharp => ["Console", "WriteLine", "String"].contains(&s),
+        Language::Go => ["fmt", "Println", "Printf", "Errorf", "string", "int"].contains(&s),
+        Language::Rust => [
+            "println", "eprintln", "String", "Vec", "Result", "Ok", "Err", "str", "i32", "u32",
+            "usize",
+        ]
+        .contains(&s),
+        Language::Sql => ["count", "sum", "avg", "min", "max"].contains(&s),
+        Language::Bash => ["echo", "printf", "local", "export"].contains(&s),
+        Language::CCpp => [
+            "std", "cout", "endl", "printf", "string", "include", "iostream", "ostream",
+        ]
+        .contains(&s),
+        _ => false,
+    }
+}
+
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
         Language::Python => &[

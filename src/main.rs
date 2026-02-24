@@ -1,6 +1,7 @@
 mod cli;
 mod error;
 mod fs_ops;
+mod language;
 mod mapping;
 mod obfuscator;
 mod ollama;
@@ -46,9 +47,8 @@ fn err(msg: &str) -> AppResult<()> {
 
 fn forward(args: &Args) -> AppResult<()> {
     let files = fs_ops::read_text_tree(&args.source)?;
-    let texts = files.iter().map(|x| x.text.clone()).collect::<Vec<_>>();
     let mut map = load_manual(args.mapping.as_deref())?;
-    let terms = detect_terms(&texts)?;
+    let terms = detect_terms(&files)?;
     merge_ai(args, &terms, &mut map)?;
     enrich_with_random(&mut map, &terms, args.seed);
     apply_and_save(args, files, map)

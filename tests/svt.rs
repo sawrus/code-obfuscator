@@ -9,11 +9,15 @@ use tempfile::tempdir;
 fn svt_large_tree_finishes_and_reports_stats() {
     let src = tempdir().expect("src");
     let out = tempdir().expect("out");
-    for i in 0..300 {
-        let file = src.path().join(format!("m{i}.rs"));
+    let exts = [
+        "rs", "py", "js", "ts", "java", "cs", "cpp", "go", "sql", "sh",
+    ];
+    for i in 0..500 {
+        let ext = exts[i % exts.len()];
+        let file = src.path().join(format!("m{i}.{ext}"));
         fs::write(
             file,
-            format!("fn Freeze{i}() {{ let Antifraud{i} = {i}; }}"),
+            format!("fn Freeze{i}() {{ let Antifraud{i} = {i}; }} # Freeze{i} Antifraud{i}"),
         )
         .expect("write");
     }
@@ -33,5 +37,5 @@ fn svt_large_tree_finishes_and_reports_stats() {
 
     assert!(elapsed.as_secs() < 30, "svt took too long: {elapsed:?}");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout");
-    assert!(stdout.contains("processed_files=300"));
+    assert!(stdout.contains("processed_files=500"));
 }

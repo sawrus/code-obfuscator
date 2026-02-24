@@ -149,19 +149,19 @@ fn maybe_obfuscate_sql_in_string(
         return segment.to_string();
     }
 
-    let (start_delimiter, end_delimiter) =
-        if segment.starts_with("\"\"\"") && segment.ends_with("\"\"\"") && segment.len() >= 6 {
-            (3, 3)
-        } else if segment.starts_with("'''") && segment.ends_with("'''") && segment.len() >= 6 {
-            (3, 3)
-        } else if (segment.starts_with('"') && segment.ends_with('"'))
-            || (segment.starts_with('\'') && segment.ends_with('\''))
-            || (segment.starts_with('`') && segment.ends_with('`'))
-        {
-            (1, 1)
-        } else {
-            return segment.to_string();
-        };
+    let is_triple_quoted = ((segment.starts_with("\"\"\"") && segment.ends_with("\"\"\""))
+        || (segment.starts_with("'''") && segment.ends_with("'''")))
+        && segment.len() >= 6;
+    let (start_delimiter, end_delimiter) = if is_triple_quoted {
+        (3, 3)
+    } else if (segment.starts_with('"') && segment.ends_with('"'))
+        || (segment.starts_with('\'') && segment.ends_with('\''))
+        || (segment.starts_with('`') && segment.ends_with('`'))
+    {
+        (1, 1)
+    } else {
+        return segment.to_string();
+    };
 
     let content = &segment[start_delimiter..segment.len() - end_delimiter];
     if !looks_like_sql(content) {

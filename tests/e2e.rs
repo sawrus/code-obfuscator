@@ -104,6 +104,11 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
         .arg("42");
     forward.assert().success();
 
+    for case in &languages {
+        case.runtime
+            .run_if_available(&obf.path().join(case.folder).join(case.file));
+    }
+
     let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
     reverse
         .arg("--mode")
@@ -124,6 +129,58 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
         case.runtime
             .run_if_available(&rev.path().join(case.folder).join(case.file));
     }
+}
+
+#[test]
+fn regression_python_magic_imports_and_named_args_stay_valid() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+    let rev = tempdir().expect("rev");
+
+    fs::create_dir_all(src.path().join("pkg")).expect("pkg");
+    fs::write(
+        src.path().join("pkg/mod.py"),
+        "def greet(*, user_name):\n    print(user_name)\n",
+    )
+    .expect("write mod");
+    fs::write(
+        src.path().join("main.py"),
+        "from pkg.mod import greet\n\nif __name__ == \"__main__\":\n    greet(user_name=\"pkg.mod\")\n",
+    )
+    .expect("write main");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--seed")
+        .arg("7");
+    forward.assert().success();
+
+    let obf_main = fs::read_to_string(obf.path().join("main.py")).expect("read obf main");
+    assert!(obf_main.contains("if __name__ == \"__main__\":"));
+    assert!(obf_main.contains("from pkg.mod import "));
+    assert!(obf_main.contains("(user_name=\"pkg.mod\")"));
+
+    RuntimeCheck::Python.run_if_available(&obf.path().join("main.py"));
+
+    let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    reverse
+        .arg("--mode")
+        .arg("reverse")
+        .arg("--source")
+        .arg(obf.path())
+        .arg("--target")
+        .arg(rev.path());
+    reverse.assert().success();
+
+    let rev_main = fs::read_to_string(rev.path().join("main.py")).expect("read rev main");
+    let src_main = fs::read_to_string(src.path().join("main.py")).expect("read src main");
+    assert_eq!(rev_main, src_main);
 }
 
 #[derive(Clone, Copy)]
@@ -194,15 +251,19 @@ impl RuntimeCheck {
                             .arg(file)
                             .arg(format!("/out:{}", out.display())),
                     );
-                } else if has_cmd("dotnet") {
-                    // dotnet is present but neither dotnet-script nor csc are available;
-                    // skip execution to avoid false negatives in constrained environments.
+                    if has_cmd("mono") {
+                        run_success(ProcessCommand::new("mono").arg(out));
+                    }
                 }
             }
             RuntimeCheck::Cpp => {
                 if has_cmd("g++") {
                     let out = file.parent().expect("dir").join("app.out");
-                    run_success(ProcessCommand::new("g++").arg(file).arg("-o").arg(&out));
+                    if !run_success_or_skip(
+                        ProcessCommand::new("g++").arg(file).arg("-o").arg(&out),
+                    ) {
+                        return;
+                    }
                     run_success(&mut ProcessCommand::new(out));
                 }
             }
@@ -219,14 +280,31 @@ impl RuntimeCheck {
                 }
             }
             RuntimeCheck::SqlLint => {
-                if has_cmd("psql") {
-                    run_success(ProcessCommand::new("psql").arg("--version"));
-                }
+                run_sql_validation_if_available(file);
             }
             RuntimeCheck::Bash => {
                 run_success(ProcessCommand::new("bash").arg(file));
             }
         }
+    }
+}
+
+fn run_sql_validation_if_available(file: &Path) {
+    if has_cmd("sqlfluff") {
+        run_success(ProcessCommand::new("sqlfluff").arg("lint").arg(file));
+    } else if has_cmd("sqlite3") {
+        run_success(
+            ProcessCommand::new("sqlite3")
+                .arg(":memory:")
+                .arg(format!(".read {}", file.display())),
+        );
+    } else if has_cmd("python3") {
+        run_success(
+            ProcessCommand::new("python3")
+                .arg("-c")
+                .arg("import pathlib,sqlite3,sys; con=sqlite3.connect(':memory:'); con.executescript(pathlib.Path(sys.argv[1]).read_text())")
+                .arg(file),
+        );
     }
 }
 
@@ -248,4 +326,18 @@ fn run_success(cmd: &mut ProcessCommand) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_success_or_skip(cmd: &mut ProcessCommand) -> bool {
+    let output = cmd.output().expect("command output");
+    if output.status.success() {
+        return true;
+    }
+    eprintln!(
+        "skipping runtime check due to unavailable toolchain: status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }

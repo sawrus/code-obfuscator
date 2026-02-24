@@ -73,10 +73,32 @@ fn collect_terms(
 ) {
     for m in re.find_iter(text) {
         let s = m.as_str();
-        if !is_keyword(lang, s) {
+        if !is_keyword(lang, s) && !is_reserved_identifier(lang, s) {
             out.insert(s.to_string());
         }
     }
+}
+
+fn is_reserved_identifier(_lang: crate::language::Language, s: &str) -> bool {
+    (s.starts_with("__") && s.ends_with("__"))
+        || matches!(
+            s,
+            "main"
+                | "self"
+                | "cls"
+                | "print"
+                | "printf"
+                | "println"
+                | "Println"
+                | "Main"
+                | "Program"
+                | "String"
+                | "args"
+                | "str"
+                | "string"
+                | "std"
+                | "echo"
+        )
 }
 
 pub fn enrich_with_random(
@@ -339,7 +361,35 @@ mod tests {
         .expect("terms");
         assert!(terms.contains("CustomerName"));
         assert!(terms.contains("comment"));
-        assert!(terms.contains("string"));
+    }
+
+    #[test]
+    fn skips_magic_and_reserved_identifiers() {
+        let terms = detect_terms(&[FileEntry {
+            rel: "main.py".into(),
+            text: "if __name__ == \"__main__\":\n    def main(self, cls):\n        return cls\n"
+                .into(),
+        }])
+        .expect("terms");
+        assert!(!terms.contains("__name__"));
+        assert!(!terms.contains("__main__"));
+        assert!(!terms.contains("main"));
+        assert!(!terms.contains("self"));
+        assert!(!terms.contains("cls"));
+    }
+
+    #[test]
+    fn mapping_is_reversible_after_enrich() {
+        let mut map = BTreeMap::new();
+        map.insert("Alpha".to_string(), "Go".to_string());
+        let terms = BTreeSet::from(["Beta".to_string(), "Gamma".to_string()]);
+        let files: Vec<FileEntry> = Vec::new();
+        enrich_with_random(&mut map, &terms, &files, Some(42));
+
+        let reverse = invert(&map).expect("invert");
+        for (from, to) in &map {
+            assert_eq!(reverse.get(to), Some(from));
+        }
     }
 
     #[test]

@@ -32,11 +32,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/code-obfuscator-${{ matrix.target }}${{ endsWith(matrix.bin, '.exe') && '.exe' || '' }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bin }}-${{ matrix.target }}
-          path: dist/${{ matrix.bin }}
+          path: dist/code-obfuscator-${{ matrix.target }}${{ endsWith(matrix.bin, '.exe') && '.exe' || '' }}
 
   publish:
     runs-on: ubuntu-latest

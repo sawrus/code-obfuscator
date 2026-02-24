@@ -36,8 +36,12 @@ fn apply_rules(
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        if let Some((next, segment)) = scan_string_or_comment(text, i, lang) {
-            out.push_str(segment);
+        if let Some((next, segment, kind)) = scan_string_or_comment(text, i, lang) {
+            if matches!(kind, SegmentKind::String) {
+                out.push_str(&maybe_obfuscate_sql_in_string(segment, map, lang));
+            } else {
+                out.push_str(segment);
+            }
             i = next;
             continue;
         }
@@ -76,23 +80,41 @@ fn apply_rules(
     out
 }
 
-fn scan_string_or_comment(text: &str, i: usize, lang: Language) -> Option<(usize, &str)> {
+#[derive(Copy, Clone)]
+enum SegmentKind {
+    Comment,
+    String,
+}
+
+fn scan_string_or_comment(
+    text: &str,
+    i: usize,
+    lang: Language,
+) -> Option<(usize, &str, SegmentKind)> {
     let rest = &text[i..];
     if supports_hash_comments(lang) && rest.starts_with('#') {
         let end = rest.find('\n').map(|x| i + x).unwrap_or(text.len());
-        return Some((end, &text[i..end]));
+        return Some((end, &text[i..end], SegmentKind::Comment));
     }
     if supports_line_comments(lang) && rest.starts_with("//") {
         let end = rest.find('\n').map(|x| i + x).unwrap_or(text.len());
-        return Some((end, &text[i..end]));
+        return Some((end, &text[i..end], SegmentKind::Comment));
     }
     if supports_block_comments(lang) && rest.starts_with("/*") {
         let end = rest.find("*/").map(|x| i + x + 2).unwrap_or(text.len());
-        return Some((end, &text[i..end]));
+        return Some((end, &text[i..end], SegmentKind::Comment));
     }
     if supports_sql_comments(lang) && rest.starts_with("--") {
         let end = rest.find('\n').map(|x| i + x).unwrap_or(text.len());
-        return Some((end, &text[i..end]));
+        return Some((end, &text[i..end], SegmentKind::Comment));
+    }
+    if matches!(lang, Language::Python) && (rest.starts_with("\"\"\"") || rest.starts_with("'''")) {
+        let quote = &rest[..3];
+        let end = rest
+            .get(3..)
+            .and_then(|tail| tail.find(quote).map(|x| i + 3 + x + 3))
+            .unwrap_or(text.len());
+        return Some((end, &text[i..end], SegmentKind::String));
     }
     if rest.starts_with('"') || rest.starts_with('\'') || rest.starts_with('`') {
         let quote = rest.chars().next().expect("quote");
@@ -113,9 +135,59 @@ fn scan_string_or_comment(text: &str, i: usize, lang: Language) -> Option<(usize
                 break;
             }
         }
-        return Some((j, &text[i..j]));
+        return Some((j, &text[i..j], SegmentKind::String));
     }
     None
+}
+
+fn maybe_obfuscate_sql_in_string(
+    segment: &str,
+    map: &BTreeMap<String, String>,
+    lang: Language,
+) -> String {
+    if matches!(lang, Language::Sql) {
+        return segment.to_string();
+    }
+
+    let is_triple_quoted = ((segment.starts_with("\"\"\"") && segment.ends_with("\"\"\""))
+        || (segment.starts_with("'''") && segment.ends_with("'''")))
+        && segment.len() >= 6;
+    let (start_delimiter, end_delimiter) = if is_triple_quoted {
+        (3, 3)
+    } else if (segment.starts_with('"') && segment.ends_with('"'))
+        || (segment.starts_with('\'') && segment.ends_with('\''))
+        || (segment.starts_with('`') && segment.ends_with('`'))
+    {
+        (1, 1)
+    } else {
+        return segment.to_string();
+    };
+
+    let content = &segment[start_delimiter..segment.len() - end_delimiter];
+    if !looks_like_sql(content) {
+        return segment.to_string();
+    }
+
+    let obfuscated = apply_rules(content, map, Language::Sql, &BTreeSet::new());
+    let mut out =
+        String::with_capacity(segment.len() + obfuscated.len().saturating_sub(content.len()));
+    out.push_str(&segment[..start_delimiter]);
+    out.push_str(&obfuscated);
+    out.push_str(&segment[segment.len() - end_delimiter..]);
+    out
+}
+
+fn looks_like_sql(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    let tokens: BTreeSet<&str> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    (tokens.contains("select") && (tokens.contains("from") || tokens.contains("join")))
+        || (tokens.contains("insert") && tokens.contains("into"))
+        || tokens.contains("update")
+        || (tokens.contains("delete") && tokens.contains("from"))
 }
 
 fn supports_hash_comments(lang: Language) -> bool {
@@ -192,13 +264,24 @@ fn is_javascript_camel_case_identifier(token: &str, lang: Language) -> bool {
     token.chars().any(|c| c.is_ascii_uppercase())
 }
 
-fn is_member_access_identifier(text: &str, start: usize, end: usize, lang: Language) -> bool {
+fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Language) -> bool {
     if matches!(lang, Language::Sql) {
         return false;
     }
-    let prev = text[..start].chars().rev().find(|c| !c.is_whitespace());
-    let rest = text[end..].trim_start();
-    matches!(prev, Some('.' | ':' | '#')) || rest.starts_with('.') || rest.starts_with("::")
+
+    let mut prev = None;
+    for c in text[..start].chars().rev() {
+        if c == '\n' || c == '\r' {
+            break;
+        }
+        if c.is_whitespace() {
+            continue;
+        }
+        prev = Some(c);
+        break;
+    }
+
+    matches!(prev, Some('.' | ':' | '#'))
 }
 
 fn collect_python_imported_symbols_from_files(files: &[FileEntry]) -> BTreeSet<String> {
@@ -543,5 +626,74 @@ mod tests {
             assert!(!transformed.contains("refill_action"));
             assert!(!transformed.contains("user_id"));
         }
+    }
+
+    #[test]
+    fn obfuscates_sql_inside_python_multiline_string() {
+        let mut map = BTreeMap::new();
+        map.insert("column1".into(), "x1".into());
+        map.insert("table1".into(), "t1".into());
+        map.insert("table2".into(), "t2".into());
+
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "VAR_Q1 = \"\"\"\nSELECT u.column1\nFROM schema.table1 m\nJOIN schema.table2 u ON m.column1 = u.id\n\"\"\"\n".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("SELECT u.x1"));
+        assert!(out[0].1.contains("FROM schema.t1 m"));
+        assert!(out[0].1.contains("JOIN schema.t2 u"));
+    }
+
+    #[test]
+    fn renames_object_identifier_before_member_access() {
+        let mut map = BTreeMap::new();
+        map.insert("profile".into(), "p1".into());
+
+        let f = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "profile = User()
+print(profile.name)
+"
+            .into(),
+        }];
+
+        let out = transform_files(&f, &map).expect("transform");
+        assert!(out[0].1.contains("p1 = User()"));
+        assert!(out[0].1.contains("print(p1.name)"));
+    }
+
+    #[test]
+    fn renames_identifiers_on_new_line_after_colon() {
+        let mut map = BTreeMap::new();
+        map.insert("source_rows".into(), "s1".into());
+
+        let f = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "def f():
+    source_rows = [1]
+    for x in source_rows:
+        print(x)
+"
+            .into(),
+        }];
+
+        let out = transform_files(&f, &map).expect("transform");
+        assert!(out[0].1.contains("s1 = [1]"));
+        assert!(out[0].1.contains("in s1:"));
+    }
+    #[test]
+    fn does_not_obfuscate_non_sql_strings() {
+        let mut map = BTreeMap::new();
+        map.insert("table1".into(), "t1".into());
+
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "message = \"table1 should stay in plain text\"\n".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("table1 should stay in plain text"));
     }
 }

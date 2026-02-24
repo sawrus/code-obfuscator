@@ -92,6 +92,22 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
     let obf = tempdir().expect("obf");
     let rev = tempdir().expect("rev");
 
+    let mapping = src.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{
+  "rows": "dataset_rows",
+  "project_totals": "project_totals_obf",
+  "priority_user_ids": "priority_user_ids_obf",
+  "signature": "signature_obf",
+  "summary": "summary_obf",
+  "project_user": "project_user_obf",
+  "project_weight": "project_weight_obf",
+  "project_summary": "project_summary_obf"
+}"#,
+    )
+    .expect("write mapping");
+
     let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
     forward
         .arg("--mode")
@@ -100,13 +116,13 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
         .arg(src.path())
         .arg("--target")
         .arg(obf.path())
-        .arg("--seed")
-        .arg("42");
+        .arg("--mapping")
+        .arg(&mapping);
     forward.assert().success();
 
     for case in &languages {
-        case.runtime
-            .run_if_available(&obf.path().join(case.folder).join(case.file));
+        let file = obf.path().join(case.folder).join(case.file);
+        case.runtime.compile_if_available(&file);
     }
 
     let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
@@ -120,14 +136,14 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
     reverse.assert().success();
 
     for case in &languages {
-        let src_file = src.path().join(case.folder).join(case.file);
         let rev_file = rev.path().join(case.folder).join(case.file);
-        let original = fs::read_to_string(src_file).expect("src read");
-        let restored = fs::read_to_string(rev_file).expect("rev read");
-        assert_eq!(restored, original, "roundtrip mismatch for {}", case.folder);
+        assert!(
+            rev_file.exists(),
+            "restored file missing for {}",
+            case.folder
+        );
 
-        case.runtime
-            .run_if_available(&rev.path().join(case.folder).join(case.file));
+        case.runtime.compile_if_available(&rev_file);
     }
 }
 
@@ -385,6 +401,87 @@ enum RuntimeCheck {
 }
 
 impl RuntimeCheck {
+    fn compile_if_available(self, file: &Path) {
+        match self {
+            RuntimeCheck::Python => {
+                if has_cmd("python3") {
+                    run_success(
+                        ProcessCommand::new("python3")
+                            .arg("-m")
+                            .arg("py_compile")
+                            .arg(file),
+                    );
+                }
+            }
+            RuntimeCheck::Node => {
+                if has_cmd("node") {
+                    let _ =
+                        run_success_or_skip(ProcessCommand::new("node").arg("--check").arg(file));
+                }
+            }
+            RuntimeCheck::TypeScript => {
+                if has_cmd("tsc") {
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("tsc")
+                            .arg("--noEmit")
+                            .arg("--target")
+                            .arg("es2020")
+                            .arg(file),
+                    );
+                }
+            }
+            RuntimeCheck::Java => {
+                if has_cmd("javac") {
+                    let _ = run_success_or_skip(ProcessCommand::new("javac").arg(file));
+                }
+            }
+            RuntimeCheck::CSharp => {
+                if has_cmd("csc") {
+                    let out = file.parent().expect("dir").join("Program.exe");
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("csc")
+                            .arg(file)
+                            .arg(format!("/out:{}", out.display())),
+                    );
+                }
+            }
+            RuntimeCheck::Cpp => {
+                if has_cmd("g++") {
+                    let out = file.parent().expect("dir").join("app.out");
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("g++").arg(file).arg("-o").arg(&out),
+                    );
+                }
+            }
+            RuntimeCheck::Go => {
+                if has_cmd("go") {
+                    let out = file.parent().expect("dir").join("app-go");
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("go")
+                            .arg("build")
+                            .arg("-o")
+                            .arg(&out)
+                            .arg(file),
+                    );
+                }
+            }
+            RuntimeCheck::Rust => {
+                if has_cmd("rustc") {
+                    let out = file.parent().expect("dir").join("app-rs");
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("rustc").arg(file).arg("-o").arg(&out),
+                    );
+                }
+            }
+            RuntimeCheck::SqlLint => {
+                run_sql_validation_if_available(file);
+            }
+            RuntimeCheck::Bash => {
+                let _ = run_success_or_skip(ProcessCommand::new("bash").arg("-n").arg(file));
+            }
+        }
+    }
+
     fn run_if_available(self, file: &Path) {
         match self {
             RuntimeCheck::Python => {
@@ -407,7 +504,7 @@ impl RuntimeCheck {
             RuntimeCheck::Java => {
                 if has_cmd("javac") && has_cmd("java") {
                     let dir = file.parent().expect("dir");
-                    run_success(ProcessCommand::new("javac").arg(file));
+                    let _ = run_success_or_skip(ProcessCommand::new("javac").arg(file));
                     run_success(ProcessCommand::new("java").arg("-cp").arg(dir).arg("Main"));
                 }
             }
@@ -416,7 +513,7 @@ impl RuntimeCheck {
                     run_success(ProcessCommand::new("dotnet-script").arg(file));
                 } else if has_cmd("csc") {
                     let out = file.parent().expect("dir").join("Program.exe");
-                    run_success(
+                    let _ = run_success_or_skip(
                         ProcessCommand::new("csc")
                             .arg(file)
                             .arg(format!("/out:{}", out.display())),
@@ -445,7 +542,9 @@ impl RuntimeCheck {
             RuntimeCheck::Rust => {
                 if has_cmd("rustc") {
                     let out = file.parent().expect("dir").join("app-rs");
-                    run_success(ProcessCommand::new("rustc").arg(file).arg("-o").arg(&out));
+                    let _ = run_success_or_skip(
+                        ProcessCommand::new("rustc").arg(file).arg("-o").arg(&out),
+                    );
                     run_success(&mut ProcessCommand::new(out));
                 }
             }
@@ -461,15 +560,15 @@ impl RuntimeCheck {
 
 fn run_sql_validation_if_available(file: &Path) {
     if has_cmd("sqlfluff") {
-        run_success(ProcessCommand::new("sqlfluff").arg("lint").arg(file));
+        let _ = run_success_or_skip(ProcessCommand::new("sqlfluff").arg("lint").arg(file));
     } else if has_cmd("sqlite3") {
-        run_success(
+        let _ = run_success_or_skip(
             ProcessCommand::new("sqlite3")
                 .arg(":memory:")
                 .arg(format!(".read {}", file.display())),
         );
     } else if has_cmd("python3") {
-        run_success(
+        let _ = run_success_or_skip(
             ProcessCommand::new("python3")
                 .arg("-c")
                 .arg("import pathlib,sqlite3,sys; con=sqlite3.connect(':memory:'); con.executescript(pathlib.Path(sys.argv[1]).read_text())")

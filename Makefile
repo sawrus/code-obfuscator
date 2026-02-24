@@ -26,7 +26,7 @@ svt:
 	cargo test --test svt -- --ignored
 
 coverage:
-	cargo llvm-cov --workspace --all-features --lcov --output-path coverage.lcov
+	cargo llvm-cov --workspace --all-features --fail-under-lines 70 --lcov --output-path coverage.lcov
 
 release-cross:
 	@for t in $(TARGETS); do \

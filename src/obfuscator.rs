@@ -213,12 +213,12 @@ fn is_python_import_path_token(text: &str, start: usize, end: usize, lang: Langu
     let line = &text[line_start..line_end];
     let trimmed = line.trim_start();
 
-    if let Some(import_idx) = trimmed.find(" import ") {
-        if trimmed.starts_with("from ") {
-            let module_start = line_start + (line.len() - trimmed.len()) + "from ".len();
-            let module_end = line_start + (line.len() - trimmed.len()) + import_idx;
-            return start >= module_start && end <= module_end;
-        }
+    if let Some(import_idx) = trimmed.find(" import ")
+        && trimmed.starts_with("from ")
+    {
+        let module_start = line_start + (line.len() - trimmed.len()) + "from ".len();
+        let module_end = line_start + (line.len() - trimmed.len()) + import_idx;
+        return start >= module_start && end <= module_end;
     }
     if trimmed.starts_with("import ") {
         return true;

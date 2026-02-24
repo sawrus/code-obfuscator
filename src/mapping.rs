@@ -4,12 +4,12 @@ use std::path::Path;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::FileEntry;
-use crate::language::{detect_language, is_keyword};
+use crate::language::detect_language;
+use crate::transform;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MappingFile {
@@ -57,26 +57,11 @@ fn err_dup(v: &str) -> AppResult<BTreeMap<String, String>> {
 
 pub fn detect_terms(files: &[FileEntry]) -> AppResult<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    let re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")?;
     for file in files {
         let lang = detect_language(&file.rel, &file.text);
-        collect_terms(&re, &file.text, lang, &mut out);
+        transform::collect_terms(&file.text, lang, &mut out);
     }
     Ok(out)
-}
-
-fn collect_terms(
-    re: &Regex,
-    text: &str,
-    lang: crate::language::Language,
-    out: &mut BTreeSet<String>,
-) {
-    for m in re.find_iter(text) {
-        let s = m.as_str();
-        if !is_keyword(lang, s) {
-            out.insert(s.to_string());
-        }
-    }
 }
 
 pub fn enrich_with_random(
@@ -250,14 +235,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_strings_and_comments_tokens_for_obfuscation() {
+    fn skips_strings_and_comments_for_obfuscation() {
         let terms = detect_terms(&[FileEntry {
             rel: "main.py".into(),
             text: "# CustomerName comment\ntext = \"CustomerName in string\"\n".into(),
         }])
         .expect("terms");
-        assert!(terms.contains("CustomerName"));
-        assert!(terms.contains("comment"));
-        assert!(terms.contains("string"));
+        assert!(!terms.contains("CustomerName"));
+        assert!(!terms.contains("comment"));
+        assert!(!terms.contains("string"));
     }
 }

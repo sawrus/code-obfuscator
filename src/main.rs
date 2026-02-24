@@ -5,6 +5,7 @@ mod language;
 mod mapping;
 mod obfuscator;
 mod ollama;
+mod transform;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

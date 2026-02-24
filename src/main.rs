@@ -50,7 +50,7 @@ fn forward(args: &Args) -> AppResult<()> {
     let mut map = load_manual(args.mapping.as_deref())?;
     let terms = detect_terms(&files)?;
     merge_ai(args, &terms, &mut map)?;
-    enrich_with_random(&mut map, &terms, args.seed);
+    enrich_with_random(&mut map, &terms, &files, args.seed);
     apply_and_save(args, files, map)
 }
 

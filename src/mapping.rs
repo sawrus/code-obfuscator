@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::fs_ops::FileEntry;
-use crate::language::{detect_language, is_keyword};
+use crate::language::{Language, detect_language, is_keyword, is_valid_identifier_for};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MappingFile {
@@ -82,13 +82,63 @@ fn collect_terms(
 pub fn enrich_with_random(
     map: &mut BTreeMap<String, String>,
     terms: &BTreeSet<String>,
+    files: &[FileEntry],
     seed: Option<u64>,
 ) {
     let mut rng = seeded(seed);
     let mut used = used_values(map);
+    let (term_namespaces, namespace_terms) = collect_namespace_terms(files);
     for term in terms {
-        maybe_insert(term, map, &mut used, &mut rng);
+        maybe_insert(
+            term,
+            map,
+            &mut used,
+            &mut rng,
+            &term_namespaces,
+            &namespace_terms,
+        );
     }
+}
+
+fn collect_namespace_terms(
+    files: &[FileEntry],
+) -> (
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeSet<String>>,
+) {
+    let re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b").expect("valid regex");
+    let mut term_namespaces: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut namespace_terms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for file in files {
+        let lang = detect_language(&file.rel, &file.text);
+        let ns = namespace_for(file);
+        for m in re.find_iter(&file.text) {
+            let s = m.as_str();
+            if is_keyword(lang, s) {
+                continue;
+            }
+            namespace_terms
+                .entry(ns.clone())
+                .or_default()
+                .insert(s.to_string());
+            term_namespaces
+                .entry(s.to_string())
+                .or_default()
+                .insert(ns.clone());
+        }
+    }
+    (term_namespaces, namespace_terms)
+}
+
+fn namespace_for(file: &FileEntry) -> String {
+    let parent = file.rel.parent().unwrap_or_else(|| Path::new(""));
+    let ext = file
+        .rel
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    format!("{}::{}", parent.display(), ext)
 }
 
 fn seeded(seed: Option<u64>) -> StdRng {
@@ -105,21 +155,52 @@ fn maybe_insert(
     map: &mut BTreeMap<String, String>,
     used: &mut BTreeSet<String>,
     rng: &mut StdRng,
+    term_namespaces: &BTreeMap<String, BTreeSet<String>>,
+    namespace_terms: &BTreeMap<String, BTreeSet<String>>,
 ) {
     if map.contains_key(term) {
         return;
     }
-    let value = next_unique(used, rng);
+    let value = next_unique(term, used, rng, term_namespaces, namespace_terms);
     map.insert(term.to_string(), value);
 }
 
-fn next_unique(used: &mut BTreeSet<String>, rng: &mut StdRng) -> String {
+fn next_unique(
+    term: &str,
+    used: &mut BTreeSet<String>,
+    rng: &mut StdRng,
+    term_namespaces: &BTreeMap<String, BTreeSet<String>>,
+    namespace_terms: &BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    let namespaces = term_namespaces.get(term);
     loop {
         let candidate = format!("{}{}", pick(rng), rng.random_range(1000..9999));
+        if !is_valid_identifier_for(Language::Unknown, &candidate) {
+            continue;
+        }
+        if !is_namespace_safe(&candidate, namespaces, namespace_terms) {
+            continue;
+        }
         if used.insert(candidate.clone()) {
             return candidate;
         }
     }
+}
+
+fn is_namespace_safe(
+    candidate: &str,
+    namespaces: Option<&BTreeSet<String>>,
+    namespace_terms: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let Some(namespaces) = namespaces else {
+        return true;
+    };
+    namespaces.iter().all(|ns| {
+        namespace_terms
+            .get(ns)
+            .map(|existing| !existing.contains(candidate))
+            .unwrap_or(true)
+    })
 }
 
 fn pick(rng: &mut StdRng) -> &'static str {
@@ -259,5 +340,20 @@ mod tests {
         assert!(terms.contains("CustomerName"));
         assert!(terms.contains("comment"));
         assert!(terms.contains("string"));
+    }
+
+    #[test]
+    fn avoids_namespace_collisions_and_entrypoints() {
+        let files = vec![FileEntry {
+            rel: "src/main.rs".into(),
+            text: "fn main() { let Falcon1000 = 1; let Token = 2; }".into(),
+        }];
+        let mut map = BTreeMap::new();
+        let mut terms = BTreeSet::new();
+        terms.insert("Token".to_string());
+        enrich_with_random(&mut map, &terms, &files, Some(1));
+        let generated = map.get("Token").expect("mapped");
+        assert_ne!(generated, "main");
+        assert_ne!(generated, "Falcon1000");
     }
 }

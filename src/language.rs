@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use regex::Regex;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Python,
@@ -41,6 +43,81 @@ pub fn detect_language(path: &Path, text: &str) -> Language {
 pub fn is_keyword(lang: Language, s: &str) -> bool {
     keywords(lang).contains(&s) || keywords(lang).contains(&s.to_ascii_lowercase().as_str())
 }
+
+pub fn is_valid_identifier_for(lang: Language, candidate: &str) -> bool {
+    if candidate.is_empty()
+        || is_keyword(lang, candidate)
+        || is_protected_system_name(candidate)
+        || is_protected_entrypoint_name(candidate)
+    {
+        return false;
+    }
+
+    match lang {
+        Language::Python
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Java
+        | Language::CSharp
+        | Language::CCpp
+        | Language::Go
+        | Language::Rust
+        | Language::Bash
+        | Language::Unknown => ident_re().is_match(candidate),
+        Language::Sql => sql_ident_re().is_match(candidate),
+    }
+}
+
+pub fn is_protected_system_name(s: &str) -> bool {
+    PROTECTED_SYSTEM_NAMES.contains(&s)
+}
+
+pub fn is_protected_entrypoint_name(s: &str) -> bool {
+    PROTECTED_ENTRYPOINTS.contains(&s)
+}
+
+fn ident_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"))
+}
+
+fn sql_ident_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_\$]*$").expect("valid regex"))
+}
+
+const PROTECTED_SYSTEM_NAMES: &[&str] = &[
+    "__init__",
+    "__name__",
+    "__main__",
+    "__file__",
+    "constructor",
+    "prototype",
+    "toString",
+    "valueOf",
+    "String",
+    "Object",
+    "Array",
+    "Error",
+    "Exception",
+    "System",
+    "Console",
+    "Program",
+];
+
+const PROTECTED_ENTRYPOINTS: &[&str] = &[
+    "main",
+    "Main",
+    "Program",
+    "_start",
+    "WinMain",
+    "DllMain",
+    "init",
+    "Start",
+    "App",
+    "Application",
+    "run",
+];
 
 fn keywords(lang: Language) -> &'static [&'static str] {
     match lang {
@@ -398,5 +475,14 @@ mod tests {
     fn detects_bash_by_shebang() {
         let lang = detect_language(&PathBuf::from("script"), "#!/usr/bin/env bash\necho 1");
         assert_eq!(lang, Language::Bash);
+    }
+
+    #[test]
+    fn validates_identifiers_and_rejects_protected_names() {
+        assert!(is_valid_identifier_for(Language::Rust, "Falcon1000"));
+        assert!(!is_valid_identifier_for(Language::Rust, "1Falcon"));
+        assert!(!is_valid_identifier_for(Language::Java, "class"));
+        assert!(!is_valid_identifier_for(Language::Python, "__init__"));
+        assert!(!is_valid_identifier_for(Language::Go, "main"));
     }
 }

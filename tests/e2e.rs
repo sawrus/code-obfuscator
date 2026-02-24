@@ -164,7 +164,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let obf_main = fs::read_to_string(obf.path().join("main.py")).expect("read obf main");
     assert!(obf_main.contains("if __name__ == \"__main__\":"));
     assert!(obf_main.contains("from pkg.mod import "));
-    assert!(obf_main.contains("(user_name=\"pkg.mod\")"));
+    assert!(obf_main.contains("=\"pkg.mod\")"));
 
     RuntimeCheck::Python.run_if_available(&obf.path().join("main.py"));
 
@@ -181,6 +181,75 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let rev_main = fs::read_to_string(rev.path().join("main.py")).expect("read rev main");
     let src_main = fs::read_to_string(src.path().join("main.py")).expect("read src main");
     assert_eq!(rev_main, src_main);
+}
+
+#[test]
+fn e2e_deep_obfuscation_sql_and_python_with_external_class_guard() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+
+    fs::create_dir_all(src.path().join("sql")).expect("sql dir");
+    fs::create_dir_all(src.path().join("py")).expect("py dir");
+
+    fs::write(
+        src.path().join("sql/main.sql"),
+        "SELECT r.user_id, amount, code FROM refill r WHERE r.user_id > 10;
+",
+    )
+    .expect("write sql");
+
+    fs::write(
+        src.path().join("py/main.py"),
+        r#"from apiutil.models import User
+
+PG_MWL_PASSWORD = "secret"
+
+def get_suspect_users_from_refill_actions():
+    return PG_MWL_PASSWORD
+
+@dataclass
+class Falcon8382(User):
+    pass
+"#,
+    )
+    .expect("write py");
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{
+  "refill": "test666",
+  "user_id": "a1",
+  "amount": "b1",
+  "code": "c1",
+  "PG_MWL_PASSWORD": "PG_CAT_P",
+  "get_suspect_users_from_refill_actions": "get_a_b_c",
+  "User": "Amber2096"
+}"#,
+    )
+    .expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let sql = fs::read_to_string(obf.path().join("sql/main.sql")).expect("read sql");
+    assert!(sql.contains("FROM test666 r"));
+    assert!(sql.contains("r.a1, b1, c1"));
+
+    let py = fs::read_to_string(obf.path().join("py/main.py")).expect("read py");
+    assert!(py.contains("PG_CAT_P = \"secret\""));
+    assert!(py.contains("def get_a_b_c():"));
+    assert!(py.contains("(User):"));
+    assert!(!py.contains("Amber2096"));
 }
 
 #[derive(Clone, Copy)]

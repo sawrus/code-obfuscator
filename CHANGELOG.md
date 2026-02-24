@@ -1,9 +1,24 @@
 # Changelog
 
+## [0.3.0] - 2026-02-24
+
+### Added
+- Дополнительные unit-тесты, подтверждающие глубокую обфускацию идентификаторов в JavaScript, TypeScript, Java и Go.
+- Новый e2e-сценарий с явным `mapping.json`, проверяющий замену идентификаторов в JavaScript, TypeScript, Java, C#, C++, Go, Rust и Bash.
+- Расширение SVT-проверки: mixed-language нагрузочный тест теперь валидирует фактическую замену по mapping на выходных файлах.
+
+### Changed
+- Версия пакета поднята до `0.3.0`.
+- README очищен от пользовательских приватных примеров и оставляет только общие формулировки возможностей.
+
 ## [0.2.0] - 2026-02-23
 
 ### Added
 - Language-aware detection of obfuscation terms for 10 languages: Python, JavaScript, TypeScript, Java, C#, C/C++, Go, Rust, SQL, Bash.
+- Deep SQL obfuscation coverage for table and column identifiers including qualified references (`r.user_id`).
+- Deep Python obfuscation for snake_case/method/constant identifiers via mapping, including env-style names.
+- Safety guard: imported Python symbols and builtins are no longer obfuscated (e.g. external base classes stay intact).
+- New unit and e2e regression tests for SQL/Python deep obfuscation scenarios.
 - Extended test fixtures in `test-projects/` for all supported languages.
 - E2E multi-language roundtrip test with runtime validation via available compilers/interpreters.
 - CI workflow for build/test/coverage via Makefile (`make ci`).

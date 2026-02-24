@@ -164,7 +164,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let obf_main = fs::read_to_string(obf.path().join("main.py")).expect("read obf main");
     assert!(obf_main.contains("if __name__ == \"__main__\":"));
     assert!(obf_main.contains("from pkg.mod import "));
-    assert!(obf_main.contains("(user_name=\"pkg.mod\")"));
+    assert!(obf_main.contains("=\"pkg.mod\")"));
 
     RuntimeCheck::Python.run_if_available(&obf.path().join("main.py"));
 
@@ -181,6 +181,176 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let rev_main = fs::read_to_string(rev.path().join("main.py")).expect("read rev main");
     let src_main = fs::read_to_string(src.path().join("main.py")).expect("read src main");
     assert_eq!(rev_main, src_main);
+}
+
+#[test]
+fn e2e_deep_obfuscation_sql_and_python_with_external_class_guard() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+
+    fs::create_dir_all(src.path().join("sql")).expect("sql dir");
+    fs::create_dir_all(src.path().join("py")).expect("py dir");
+
+    fs::write(
+        src.path().join("sql/main.sql"),
+        "SELECT r.user_id, amount, code FROM refill r WHERE r.user_id > 10;
+",
+    )
+    .expect("write sql");
+
+    fs::write(
+        src.path().join("py/main.py"),
+        r#"from apiutil.models import User
+
+PG_MWL_PASSWORD = "secret"
+
+def get_suspect_users_from_refill_actions():
+    return PG_MWL_PASSWORD
+
+@dataclass
+class Falcon8382(User):
+    pass
+"#,
+    )
+    .expect("write py");
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{
+  "refill": "test666",
+  "user_id": "a1",
+  "amount": "b1",
+  "code": "c1",
+  "PG_MWL_PASSWORD": "PG_CAT_P",
+  "get_suspect_users_from_refill_actions": "get_a_b_c",
+  "User": "Amber2096"
+}"#,
+    )
+    .expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let sql = fs::read_to_string(obf.path().join("sql/main.sql")).expect("read sql");
+    assert!(sql.contains("FROM test666 r"));
+    assert!(sql.contains("r.a1, b1, c1"));
+
+    let py = fs::read_to_string(obf.path().join("py/main.py")).expect("read py");
+    assert!(py.contains("PG_CAT_P = \"secret\""));
+    assert!(py.contains("def get_a_b_c():"));
+    assert!(py.contains("(User):"));
+    assert!(!py.contains("Amber2096"));
+}
+
+#[test]
+fn e2e_deep_obfuscation_mapping_for_other_languages() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+
+    let fixtures = [
+        (
+            "javascript/main.js",
+            "function refill_action(user_id) { return user_id + 1; }
+",
+        ),
+        (
+            "typescript/main.ts",
+            "function refill_action(user_id: number): number { return user_id + 1; }
+",
+        ),
+        (
+            "java/Main.java",
+            "class Main { int refill_action(int user_id) { return user_id + 1; } }
+",
+        ),
+        (
+            "csharp/Program.cs",
+            "class Program { static int refill_action(int user_id) { return user_id + 1; } }
+",
+        ),
+        (
+            "cpp/main.cpp",
+            "int refill_action(int user_id) { return user_id + 1; }
+",
+        ),
+        (
+            "go/main.go",
+            "func refill_action(user_id int) int { return user_id + 1 }
+",
+        ),
+        (
+            "rust/main.rs",
+            "fn refill_action(user_id: i32) -> i32 { user_id + 1 }
+",
+        ),
+        (
+            "bash/main.sh",
+            "refill_action() { user_id=1; echo $user_id; }
+",
+        ),
+    ];
+
+    for (rel, body) in fixtures {
+        let target = src.path().join(rel);
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+        fs::write(target, body).expect("write fixture");
+    }
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(&mapping, r#"{"refill_action":"r1","user_id":"u1"}"#).expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let checks = [
+        "javascript/main.js",
+        "typescript/main.ts",
+        "java/Main.java",
+        "csharp/Program.cs",
+        "cpp/main.cpp",
+        "go/main.go",
+        "rust/main.rs",
+        "bash/main.sh",
+    ];
+
+    for rel in checks {
+        let out = fs::read_to_string(obf.path().join(rel)).expect("read output");
+        assert!(
+            out.contains("r1"),
+            "expected mapped function in {rel}: {out}"
+        );
+        assert!(
+            out.contains("u1"),
+            "expected mapped variable in {rel}: {out}"
+        );
+        assert!(
+            !out.contains("refill_action"),
+            "source function leaked in {rel}: {out}"
+        );
+        assert!(
+            !out.contains("user_id"),
+            "source variable leaked in {rel}: {out}"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::error::AppResult;
 use crate::fs_ops::FileEntry;
-use crate::language::{Language, detect_language};
+use crate::language::{Language, detect_language, is_keyword};
 
 pub fn transform_files(
     files: &[FileEntry],
@@ -59,12 +59,14 @@ fn apply_rules(
             }
             let token = &text[start..i];
             if is_reserved_identifier(token)
+                || is_keyword(lang, token)
                 || is_python_builtin_identifier(token, lang)
                 || python_imports.contains(token)
                 || globally_imported_python_symbols.contains(token)
                 || is_javascript_camel_case_identifier(token, lang)
                 || is_python_import_line(text, start, lang)
                 || is_python_import_path_token(text, start, i, lang)
+                || is_non_python_import_line(text, start, lang)
                 || is_member_access_identifier(text, start, i, lang)
             {
                 out.push_str(token);
@@ -250,6 +252,43 @@ fn is_reserved_identifier(token: &str) -> bool {
                 | "string"
                 | "str"
                 | "echo"
+                | "new"
+                | "Map"
+                | "Set"
+                | "List"
+                | "ArrayList"
+                | "HashMap"
+                | "BTreeMap"
+                | "Vec"
+                | "Result"
+                | "Option"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "bool"
+                | "char"
+                | "fn"
+                | "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "JOIN"
+                | "CREATE"
+                | "TABLE"
+                | "VIEW"
         )
 }
 
@@ -282,6 +321,39 @@ fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Lang
     }
 
     matches!(prev, Some('.' | ':' | '#'))
+}
+
+fn is_non_python_import_line(text: &str, start: usize, lang: Language) -> bool {
+    if matches!(lang, Language::Python | Language::Sql | Language::Unknown) {
+        return false;
+    }
+
+    let line_start = text[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let line = text[line_start..]
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start();
+
+    match lang {
+        Language::Rust => line.starts_with("use ") || line.starts_with("extern crate "),
+        Language::Java | Language::CSharp => {
+            line.starts_with("import ")
+                || line.starts_with("package ")
+                || line.starts_with("using ")
+        }
+        Language::CCpp => {
+            line.starts_with("#include")
+                || line.starts_with("using ")
+                || line.starts_with("namespace ")
+        }
+        Language::JavaScript | Language::TypeScript => {
+            line.starts_with("import ") || line.starts_with("export ")
+        }
+        Language::Go => line.starts_with("import ") || line.starts_with("package "),
+        Language::Bash => false,
+        Language::Python | Language::Sql | Language::Unknown => false,
+    }
 }
 
 fn collect_python_imported_symbols_from_files(files: &[FileEntry]) -> BTreeSet<String> {
@@ -695,5 +767,34 @@ print(profile.name)
 
         let out = transform_files(&files, &map).expect("transform");
         assert!(out[0].1.contains("table1 should stay in plain text"));
+    }
+
+    #[test]
+    fn keeps_language_keywords_even_if_present_in_mapping() {
+        let map = BTreeMap::from([
+            ("class".to_string(), "BrokenClassKw".to_string()),
+            ("select".to_string(), "BrokenSelectKw".to_string()),
+            ("new".to_string(), "BrokenNewKw".to_string()),
+        ]);
+
+        let files = vec![
+            FileEntry {
+                rel: "main.py".into(),
+                text: "@dataclass\nclass User:\n    pass\n".into(),
+            },
+            FileEntry {
+                rel: "main.sql".into(),
+                text: "select user_id from users;\n".into(),
+            },
+            FileEntry {
+                rel: "main.js".into(),
+                text: "const m = new Map();\n".into(),
+            },
+        ];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("class User:"));
+        assert!(out[1].1.contains("select user_id from users;"));
+        assert!(out[2].1.contains("new Map()"));
     }
 }

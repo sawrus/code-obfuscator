@@ -1,3 +1,4 @@
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -33,6 +34,11 @@ fn apply_rules(
     } else {
         BTreeSet::new()
     };
+    let python_parameters = if matches!(lang, Language::Python) {
+        collect_python_parameter_names(text)
+    } else {
+        BTreeSet::new()
+    };
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -61,7 +67,10 @@ fn apply_rules(
             if is_reserved_identifier(token)
                 || is_keyword(lang, token)
                 || is_python_builtin_identifier(token, lang)
+                || is_python_def_parameter(text, start, lang)
+                || is_python_keyword_argument_label(text, start, i, lang)
                 || python_imports.contains(token)
+                || python_parameters.contains(token)
                 || globally_imported_python_symbols.contains(token)
                 || is_javascript_camel_case_identifier(token, lang)
                 || is_python_import_line(text, start, lang)
@@ -94,6 +103,39 @@ fn scan_string_or_comment(
     lang: Language,
 ) -> Option<(usize, &str, SegmentKind)> {
     let rest = &text[i..];
+
+    if matches!(lang, Language::Python)
+        && let Some((prefix_len, quote_len, quote)) = python_string_prefix(rest)
+    {
+        let mut j = i + prefix_len + quote_len;
+        let mut escaped = false;
+        while j < text.len() {
+            let c = text[j..].chars().next().expect("char");
+            if quote_len == 3 {
+                if text[j..].starts_with(quote) {
+                    j += 3;
+                    break;
+                }
+                j += c.len_utf8();
+                continue;
+            }
+
+            j += c.len_utf8();
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' {
+                escaped = true;
+                continue;
+            }
+            if c == quote.chars().next().expect("quote") {
+                break;
+            }
+        }
+        return Some((j, &text[i..j], SegmentKind::String));
+    }
+
     if supports_hash_comments(lang) && rest.starts_with('#') {
         let end = rest.find('\n').map(|x| i + x).unwrap_or(text.len());
         return Some((end, &text[i..end], SegmentKind::Comment));
@@ -151,32 +193,176 @@ fn maybe_obfuscate_sql_in_string(
         return segment.to_string();
     }
 
-    let is_triple_quoted = ((segment.starts_with("\"\"\"") && segment.ends_with("\"\"\""))
-        || (segment.starts_with("'''") && segment.ends_with("'''")))
-        && segment.len() >= 6;
-    let (start_delimiter, end_delimiter) = if is_triple_quoted {
-        (3, 3)
-    } else if (segment.starts_with('"') && segment.ends_with('"'))
-        || (segment.starts_with('\'') && segment.ends_with('\''))
-        || (segment.starts_with('`') && segment.ends_with('`'))
-    {
-        (1, 1)
-    } else {
+    let Some((prefix_len, quote_len, is_fstring)) = string_parts(segment, lang) else {
         return segment.to_string();
     };
 
-    let content = &segment[start_delimiter..segment.len() - end_delimiter];
-    if !looks_like_sql(content) {
+    let content = &segment[prefix_len + quote_len..segment.len() - quote_len];
+    let fstring_content = if is_fstring {
+        obfuscate_python_fstring_expressions(content, map)
+    } else {
+        content.to_string()
+    };
+
+    if !looks_like_sql(&fstring_content) {
+        if is_fstring {
+            return rebuild_string(segment, prefix_len, quote_len, &fstring_content);
+        }
         return segment.to_string();
     }
 
-    let obfuscated = apply_rules(content, map, Language::Sql, &BTreeSet::new());
+    let obfuscated = apply_rules(&fstring_content, map, Language::Sql, &BTreeSet::new());
+    rebuild_string(segment, prefix_len, quote_len, &obfuscated)
+}
+
+fn rebuild_string(segment: &str, prefix_len: usize, quote_len: usize, content: &str) -> String {
     let mut out =
-        String::with_capacity(segment.len() + obfuscated.len().saturating_sub(content.len()));
-    out.push_str(&segment[..start_delimiter]);
-    out.push_str(&obfuscated);
-    out.push_str(&segment[segment.len() - end_delimiter..]);
+        String::with_capacity(segment.len() + content.len().saturating_sub(segment.len()));
+    out.push_str(&segment[..prefix_len + quote_len]);
+    out.push_str(content);
+    out.push_str(&segment[segment.len() - quote_len..]);
     out
+}
+
+fn string_parts(segment: &str, lang: Language) -> Option<(usize, usize, bool)> {
+    if matches!(lang, Language::Python)
+        && let Some((prefix_len, quote_len, _)) = python_string_prefix(segment)
+    {
+        let prefix = &segment[..prefix_len];
+        return Some((
+            prefix_len,
+            quote_len,
+            prefix.chars().any(|c| matches!(c, 'f' | 'F')),
+        ));
+    }
+
+    let is_triple_quoted = ((segment.starts_with("\"\"\"") && segment.ends_with("\"\"\""))
+        || (segment.starts_with("'''") && segment.ends_with("'''")))
+        && segment.len() >= 6;
+    if is_triple_quoted {
+        return Some((0, 3, false));
+    }
+
+    if (segment.starts_with('"') && segment.ends_with('"'))
+        || (segment.starts_with('\'') && segment.ends_with('\''))
+        || (segment.starts_with('`') && segment.ends_with('`'))
+    {
+        return Some((0, 1, false));
+    }
+
+    None
+}
+
+fn python_string_prefix(rest: &str) -> Option<(usize, usize, &'static str)> {
+    const PREFIXES: &[&str] = &[
+        "", "r", "u", "b", "f", "R", "U", "B", "F", "fr", "rf", "Fr", "fR", "RF", "rF", "FR", "br",
+        "rb", "Br", "bR", "RB", "rB", "BR",
+    ];
+
+    for prefix in PREFIXES {
+        if rest.len() < prefix.len() {
+            continue;
+        }
+        let candidate = &rest[prefix.len()..];
+        for quote in ["\"\"\"", "'''", "\"", "'"] {
+            if candidate.starts_with(quote) {
+                return Some((prefix.len(), quote.len(), quote));
+            }
+        }
+    }
+    None
+}
+
+fn obfuscate_python_fstring_expressions(content: &str, map: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(content.len());
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '{' {
+            if i + 1 < chars.len() && chars[i + 1] == '{' {
+                out.push('{');
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            let mut depth = 1;
+            while j < chars.len() {
+                if chars[j] == '{' {
+                    depth += 1;
+                } else if chars[j] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+
+            if j < chars.len() && chars[j] == '}' {
+                let expr: String = chars[i + 1..j].iter().collect();
+                let expr_obf = apply_rules(&expr, map, Language::Python, &BTreeSet::new());
+                out.push('{');
+                out.push_str(&expr_obf);
+                out.push('}');
+                i = j + 1;
+                continue;
+            }
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    out
+}
+
+fn is_python_def_parameter(text: &str, start: usize, lang: Language) -> bool {
+    if !matches!(lang, Language::Python) {
+        return false;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |idx| start + idx);
+    let line = &text[line_start..line_end];
+
+    let Some(def_pos) = line.find("def ") else {
+        return false;
+    };
+    let Some(open_pos) = line[def_pos..].find('(').map(|x| def_pos + x) else {
+        return false;
+    };
+    let Some(close_pos) = line[open_pos..].find(')').map(|x| open_pos + x) else {
+        return false;
+    };
+    let abs_open = line_start + open_pos;
+    let abs_close = line_start + close_pos;
+    start > abs_open && start < abs_close
+}
+
+fn is_python_keyword_argument_label(text: &str, start: usize, end: usize, lang: Language) -> bool {
+    if !matches!(lang, Language::Python) {
+        return false;
+    }
+
+    let next = text[end..].chars().find(|c| !c.is_whitespace());
+    if next != Some('=') {
+        return false;
+    }
+    let second = text[end..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .nth(1)
+        .unwrap_or('\0');
+    if second == '=' {
+        return false;
+    }
+
+    let prev = text[..start].chars().rev().find(|c| !c.is_whitespace());
+    matches!(prev, Some('(' | ','))
 }
 
 fn looks_like_sql(content: &str) -> bool {
@@ -304,7 +490,7 @@ fn is_javascript_camel_case_identifier(token: &str, lang: Language) -> bool {
 }
 
 fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Language) -> bool {
-    if matches!(lang, Language::Sql) {
+    if matches!(lang, Language::Sql | Language::Python) {
         return false;
     }
 
@@ -388,6 +574,24 @@ fn collect_python_imported_symbols(text: &str) -> BTreeSet<String> {
             }
         }
     }
+    out
+}
+
+fn collect_python_parameter_names(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let def_re = Regex::new(r"\bdef\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)").expect("regex");
+    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("regex");
+
+    for cap in def_re.captures_iter(text) {
+        let params = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        for ident in ident_re.find_iter(params).map(|m| m.as_str()) {
+            if matches!(ident, "self" | "cls") {
+                continue;
+            }
+            out.insert(ident.to_string());
+        }
+    }
+
     out
 }
 
@@ -796,5 +1000,37 @@ print(profile.name)
         assert!(out[0].1.contains("class User:"));
         assert!(out[1].1.contains("select user_id from users;"));
         assert!(out[2].1.contains("new Map()"));
+    }
+
+    #[test]
+    fn keeps_python_named_argument_labels_and_params_unmodified() {
+        let map = BTreeMap::from([
+            ("user_name".to_string(), "py_var_A1".to_string()),
+            ("greet".to_string(), "py_method_A1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "def greet(user_name):\n    return user_name\n\ngreet(user_name='x')\n".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("def py_method_A1(user_name):"));
+        assert!(out[0].1.contains("return user_name"));
+        assert!(out[0].1.contains("py_method_A1(user_name='x')"));
+    }
+
+    #[test]
+    fn obfuscates_identifiers_inside_python_fstring_expressions() {
+        let map = BTreeMap::from([
+            ("cards".to_string(), "py_var_A1".to_string()),
+            ("entity".to_string(), "py_var_B1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "total = f\"{len(cards)}:{entity.id}\"\n".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("f\"{len(py_var_A1)}:{py_var_B1.id}\""));
     }
 }

@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -71,12 +69,36 @@ fn collect_terms(
     lang: crate::language::Language,
     out: &mut BTreeSet<String>,
 ) {
+    let python_params = if matches!(lang, Language::Python) {
+        collect_python_parameter_names(text)
+    } else {
+        BTreeSet::new()
+    };
+
     for m in re.find_iter(text) {
         let s = m.as_str();
-        if !is_keyword(lang, s) && !is_reserved_identifier(lang, s) {
+        if !is_keyword(lang, s) && !is_reserved_identifier(lang, s) && !python_params.contains(s) {
             out.insert(s.to_string());
         }
     }
+}
+
+fn collect_python_parameter_names(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let def_re = Regex::new(r"\bdef\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)").expect("regex");
+    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("regex");
+
+    for cap in def_re.captures_iter(text) {
+        let params = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        for ident in ident_re.find_iter(params).map(|m| m.as_str()) {
+            if matches!(ident, "self" | "cls") {
+                continue;
+            }
+            out.insert(ident.to_string());
+        }
+    }
+
+    out
 }
 
 fn is_reserved_identifier(_lang: crate::language::Language, s: &str) -> bool {
@@ -105,21 +127,36 @@ pub fn enrich_with_random(
     map: &mut BTreeMap<String, String>,
     terms: &BTreeSet<String>,
     files: &[FileEntry],
-    seed: Option<u64>,
+    _seed: Option<u64>,
 ) {
-    let mut rng = seeded(seed);
     let mut used = used_values(map);
     let (term_namespaces, namespace_terms) = collect_namespace_terms(files);
+    let kinds = collect_identifier_kinds(files);
+    let mut sequence = NameSequence::default();
     for term in terms {
         maybe_insert(
             term,
             map,
             &mut used,
-            &mut rng,
+            &mut sequence,
             &term_namespaces,
             &namespace_terms,
+            kinds.get(term),
         );
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum IdentifierKind {
+    PyClass,
+    PyMethod,
+    PyField,
+    PyVar,
+    PyConst,
+    SqlSchema,
+    SqlTable,
+    GoVar,
+    Generic,
 }
 
 fn collect_namespace_terms(
@@ -163,11 +200,6 @@ fn namespace_for(file: &FileEntry) -> String {
     format!("{}::{}", parent.display(), ext)
 }
 
-fn seeded(seed: Option<u64>) -> StdRng {
-    let val = seed.unwrap_or_else(rand::random);
-    StdRng::seed_from_u64(val)
-}
-
 fn used_values(map: &BTreeMap<String, String>) -> BTreeSet<String> {
     map.values().cloned().collect()
 }
@@ -176,27 +208,31 @@ fn maybe_insert(
     term: &str,
     map: &mut BTreeMap<String, String>,
     used: &mut BTreeSet<String>,
-    rng: &mut StdRng,
+    sequence: &mut NameSequence,
     term_namespaces: &BTreeMap<String, BTreeSet<String>>,
     namespace_terms: &BTreeMap<String, BTreeSet<String>>,
+    kind: Option<&IdentifierKind>,
 ) {
     if map.contains_key(term) {
         return;
     }
-    let value = next_unique(term, used, rng, term_namespaces, namespace_terms);
+    let value = next_unique(term, used, sequence, term_namespaces, namespace_terms, kind);
     map.insert(term.to_string(), value);
 }
 
 fn next_unique(
     term: &str,
     used: &mut BTreeSet<String>,
-    rng: &mut StdRng,
+    sequence: &mut NameSequence,
     term_namespaces: &BTreeMap<String, BTreeSet<String>>,
     namespace_terms: &BTreeMap<String, BTreeSet<String>>,
+    kind: Option<&IdentifierKind>,
 ) -> String {
     let namespaces = term_namespaces.get(term);
+    let prefix = select_prefix(term, kind.copied().unwrap_or(IdentifierKind::Generic));
+
     loop {
-        let candidate = format!("{}{}", pick(rng), rng.random_range(1000..9999));
+        let candidate = sequence.next(&prefix);
         if !is_valid_identifier_for(Language::Unknown, &candidate) {
             continue;
         }
@@ -225,14 +261,130 @@ fn is_namespace_safe(
     })
 }
 
-fn pick(rng: &mut StdRng) -> &'static str {
-    let idx = rng.random_range(0..PREFIX.len());
-    PREFIX[idx]
+fn select_prefix(term: &str, kind: IdentifierKind) -> String {
+    let raw = match kind {
+        IdentifierKind::PyClass => "py_class",
+        IdentifierKind::PyMethod => "py_method",
+        IdentifierKind::PyField => "py_field",
+        IdentifierKind::PyVar => "py_var",
+        IdentifierKind::PyConst => "py_const",
+        IdentifierKind::SqlSchema => "sql_schema",
+        IdentifierKind::SqlTable => "sql_table",
+        IdentifierKind::GoVar => "go_var",
+        IdentifierKind::Generic => "py_var",
+    };
+
+    if term.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+        return raw.to_ascii_uppercase();
+    }
+    if term.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return raw
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                let first = chars.next().unwrap_or_default().to_ascii_uppercase();
+                let rest: String = chars.collect();
+                format!("{first}{rest}")
+            })
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    raw.to_string()
 }
 
-const PREFIX: &[&str] = &[
-    "Amber", "Cedar", "Quartz", "Falcon", "Maple", "Nimbus", "Atlas", "Comet", "Coral", "River",
-];
+#[derive(Default)]
+struct NameSequence {
+    counters: BTreeMap<String, usize>,
+}
+
+impl NameSequence {
+    fn next(&mut self, prefix: &str) -> String {
+        let counter = self.counters.entry(prefix.to_string()).or_insert(0);
+        *counter += 1;
+        let suffix = sequence_suffix(*counter);
+        if !prefix.contains('_') && prefix.chars().any(|c| c.is_ascii_uppercase()) {
+            format!("{prefix}{suffix}")
+        } else {
+            format!("{prefix}_{suffix}")
+        }
+    }
+}
+
+fn sequence_suffix(n: usize) -> String {
+    let letter = ((n - 1) % 26) as u8;
+    let number = ((n - 1) / 26) + 1;
+    format!("{}{}", (b'A' + letter) as char, number)
+}
+
+fn collect_identifier_kinds(files: &[FileEntry]) -> BTreeMap<String, IdentifierKind> {
+    let mut kinds = BTreeMap::new();
+    let py_class_re = Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)").expect("regex");
+    let py_def_re = Regex::new(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("regex");
+    let py_field_re = Regex::new(r"\bself\.([A-Za-z_][A-Za-z0-9_]*)").expect("regex");
+    let sql_schema_table_re =
+        Regex::new(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b").expect("regex");
+    let sql_table_kw_re =
+        Regex::new(r"(?i)\b(from|join|update|into|table)\s+([A-Za-z_][A-Za-z0-9_]*)")
+            .expect("regex");
+    let ident_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").expect("regex");
+
+    for file in files {
+        let lang = detect_language(&file.rel, &file.text);
+        match lang {
+            Language::Python => {
+                for cap in py_class_re.captures_iter(&file.text) {
+                    kinds.insert(cap[1].to_string(), IdentifierKind::PyClass);
+                }
+                for cap in py_def_re.captures_iter(&file.text) {
+                    kinds
+                        .entry(cap[1].to_string())
+                        .or_insert(IdentifierKind::PyMethod);
+                }
+                for cap in py_field_re.captures_iter(&file.text) {
+                    kinds
+                        .entry(cap[1].to_string())
+                        .or_insert(IdentifierKind::PyField);
+                }
+                for ident in ident_re.find_iter(&file.text).map(|m| m.as_str()) {
+                    if ident.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+                        kinds
+                            .entry(ident.to_string())
+                            .or_insert(IdentifierKind::PyConst);
+                    } else {
+                        kinds
+                            .entry(ident.to_string())
+                            .or_insert(IdentifierKind::PyVar);
+                    }
+                }
+            }
+            Language::Sql => {
+                for cap in sql_schema_table_re.captures_iter(&file.text) {
+                    kinds
+                        .entry(cap[1].to_string())
+                        .or_insert(IdentifierKind::SqlSchema);
+                    kinds
+                        .entry(cap[2].to_string())
+                        .or_insert(IdentifierKind::SqlTable);
+                }
+                for cap in sql_table_kw_re.captures_iter(&file.text) {
+                    kinds
+                        .entry(cap[2].to_string())
+                        .or_insert(IdentifierKind::SqlTable);
+                }
+            }
+            Language::Go => {
+                for ident in ident_re.find_iter(&file.text).map(|m| m.as_str()) {
+                    kinds
+                        .entry(ident.to_string())
+                        .or_insert(IdentifierKind::GoVar);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    kinds
+}
 
 #[cfg(test)]
 mod tests {
@@ -254,7 +406,7 @@ mod tests {
         }])
         .expect("terms");
         assert!(terms.contains("Freeze"));
-        assert!(terms.contains("antifraud_check"));
+        assert!(!terms.contains("antifraud_check"));
         assert!(!terms.contains("def"));
         assert!(!terms.contains("return"));
     }
@@ -405,5 +557,69 @@ mod tests {
         let generated = map.get("Token").expect("mapped");
         assert_ne!(generated, "main");
         assert_ne!(generated, "Falcon1000");
+    }
+
+    #[test]
+    fn does_not_collect_python_function_parameters() {
+        let terms = detect_terms(&[FileEntry {
+            rel: "main.py".into(),
+            text: "def greet(user_name, send_to_folex=False):\n    return user_name\n".into(),
+        }])
+        .expect("terms");
+
+        assert!(!terms.contains("user_name"));
+        assert!(!terms.contains("send_to_folex"));
+        assert!(terms.contains("greet"));
+    }
+
+    #[test]
+    fn generates_kind_aware_prefixes() {
+        let files = vec![
+            FileEntry {
+                rel: "main.py".into(),
+                text: "class User:\n    def get_cats(self):\n        self.tag = 1\n\nCONST_A = 1\n"
+                    .into(),
+            },
+            FileEntry {
+                rel: "main.sql".into(),
+                text: "SELECT * FROM my_schema.refill\n".into(),
+            },
+            FileEntry {
+                rel: "main.go".into(),
+                text: "package main\nfunc run() { var cards int }\n".into(),
+            },
+        ];
+
+        let mut map = BTreeMap::new();
+        let terms = BTreeSet::from([
+            "User".to_string(),
+            "get_cats".to_string(),
+            "tag".to_string(),
+            "CONST_A".to_string(),
+            "my_schema".to_string(),
+            "refill".to_string(),
+            "cards".to_string(),
+        ]);
+        enrich_with_random(&mut map, &terms, &files, None);
+
+        assert!(map.get("User").expect("User").starts_with("PyClass"));
+        assert!(
+            map.get("get_cats")
+                .expect("get_cats")
+                .starts_with("py_method_")
+        );
+        assert!(map.get("tag").expect("tag").starts_with("py_field_"));
+        assert!(
+            map.get("CONST_A")
+                .expect("CONST_A")
+                .starts_with("PY_CONST_")
+        );
+        assert!(
+            map.get("my_schema")
+                .expect("my_schema")
+                .starts_with("sql_schema_")
+        );
+        assert!(map.get("refill").expect("refill").starts_with("sql_table_"));
+        assert!(map.get("cards").expect("cards").starts_with("go_var_"));
     }
 }

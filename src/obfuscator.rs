@@ -490,7 +490,7 @@ fn is_javascript_camel_case_identifier(token: &str, lang: Language) -> bool {
 }
 
 fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Language) -> bool {
-    if matches!(lang, Language::Sql | Language::Python) {
+    if matches!(lang, Language::Sql) {
         return false;
     }
 
@@ -1032,5 +1032,24 @@ print(profile.name)
 
         let out = transform_files(&files, &map).expect("transform");
         assert!(out[0].1.contains("f\"{len(py_var_A1)}:{py_var_B1.id}\""));
+    }
+
+    #[test]
+    fn keeps_python_member_access_identifiers_unmodified() {
+        let map = BTreeMap::from([
+            ("environ".to_string(), "py_var_A1".to_string()),
+            ("get".to_string(), "py_method_A1".to_string()),
+            ("DataFrame".to_string(), "py_method_B1".to_string()),
+            ("partner_id".to_string(), "py_var_B2".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "import os\nimport pandas as pd\n\nvalue = os.environ.get('X')\ndf = pd.DataFrame()\n_ = df[\"partner_id\"]\n".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("os.environ.get('X')"));
+        assert!(out[0].1.contains("pd.DataFrame()"));
+        assert!(out[0].1.contains("[\"partner_id\"]"));
     }
 }

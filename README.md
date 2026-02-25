@@ -104,3 +104,16 @@ cargo install cargo-llvm-cov
 
 См. `SAMPLES.md` для примеров до/после.
 
+
+
+## Full compiler/runtime E2E environment
+
+`tests/e2e.rs` runs real compile/runtime checks for Python, JavaScript/TypeScript, Java, C++, Go, Rust, SQL, Bash and C# when toolchains are present.
+
+To run with a fully provisioned toolchain container (including .NET for C#), use:
+
+```bash
+./scripts/run-e2e-full.sh
+```
+
+This script builds `docker/e2e.Dockerfile` and executes `cargo test --tests` inside that image.

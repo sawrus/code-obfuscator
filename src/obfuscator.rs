@@ -600,7 +600,7 @@ fn is_python_local_member_access_identifier(text: &str, start: usize) -> bool {
     }
 
     let expr_start = prefix
-        .rfind(|c: char| matches!(c, '\n' | ';' | '='))
+        .rfind(['\n', ';', '='])
         .map(|idx| idx + 1)
         .unwrap_or(0);
     let expr = &prefix[expr_start..];

@@ -11,13 +11,20 @@ pub fn transform_files(
     map: &BTreeMap<String, String>,
 ) -> AppResult<Vec<(PathBuf, String)>> {
     let globally_imported_python_symbols = collect_python_imported_symbols_from_files(files);
+    let python_dataclass_index = collect_python_dataclass_index(files);
     Ok(files
         .iter()
         .map(|f| {
             let lang = detect_language(&f.rel, &f.text);
             (
                 f.rel.clone(),
-                apply_rules(&f.text, map, lang, &globally_imported_python_symbols),
+                apply_rules(
+                    &f.text,
+                    map,
+                    lang,
+                    &globally_imported_python_symbols,
+                    &python_dataclass_index,
+                ),
             )
         })
         .collect())
@@ -28,6 +35,7 @@ fn apply_rules(
     map: &BTreeMap<String, String>,
     lang: Language,
     globally_imported_python_symbols: &BTreeSet<String>,
+    python_dataclass_index: &PythonDataclassIndex,
 ) -> String {
     let python_imports = if matches!(lang, Language::Python) {
         collect_python_imported_symbols(text)
@@ -44,7 +52,12 @@ fn apply_rules(
     while i < text.len() {
         if let Some((next, segment, kind)) = scan_string_or_comment(text, i, lang) {
             if matches!(kind, SegmentKind::String) {
-                out.push_str(&maybe_obfuscate_sql_in_string(segment, map, lang));
+                out.push_str(&maybe_obfuscate_sql_in_string(
+                    segment,
+                    map,
+                    lang,
+                    python_dataclass_index,
+                ));
             } else {
                 out.push_str(segment);
             }
@@ -68,7 +81,14 @@ fn apply_rules(
                 || is_keyword(lang, token)
                 || is_python_builtin_identifier(token, lang)
                 || is_python_def_parameter(text, start, lang)
-                || is_python_keyword_argument_label(text, start, i, lang)
+                || should_preserve_python_keyword_argument_label(
+                    text,
+                    start,
+                    i,
+                    token,
+                    lang,
+                    python_dataclass_index,
+                )
                 || python_imports.contains(token)
                 || python_parameters.contains(token)
                 || globally_imported_python_symbols.contains(token)
@@ -188,6 +208,7 @@ fn maybe_obfuscate_sql_in_string(
     segment: &str,
     map: &BTreeMap<String, String>,
     lang: Language,
+    python_dataclass_index: &PythonDataclassIndex,
 ) -> String {
     if matches!(lang, Language::Sql) {
         return segment.to_string();
@@ -199,7 +220,7 @@ fn maybe_obfuscate_sql_in_string(
 
     let content = &segment[prefix_len + quote_len..segment.len() - quote_len];
     let fstring_content = if is_fstring {
-        obfuscate_python_fstring_expressions(content, map)
+        obfuscate_python_fstring_expressions(content, map, python_dataclass_index)
     } else {
         content.to_string()
     };
@@ -211,7 +232,13 @@ fn maybe_obfuscate_sql_in_string(
         return segment.to_string();
     }
 
-    let obfuscated = apply_rules(&fstring_content, map, Language::Sql, &BTreeSet::new());
+    let obfuscated = apply_rules(
+        &fstring_content,
+        map,
+        Language::Sql,
+        &BTreeSet::new(),
+        python_dataclass_index,
+    );
     rebuild_string(segment, prefix_len, quote_len, &obfuscated)
 }
 
@@ -273,7 +300,11 @@ fn python_string_prefix(rest: &str) -> Option<(usize, usize, &'static str)> {
     None
 }
 
-fn obfuscate_python_fstring_expressions(content: &str, map: &BTreeMap<String, String>) -> String {
+fn obfuscate_python_fstring_expressions(
+    content: &str,
+    map: &BTreeMap<String, String>,
+    python_dataclass_index: &PythonDataclassIndex,
+) -> String {
     let mut out = String::with_capacity(content.len());
     let chars: Vec<char> = content.chars().collect();
     let mut i = 0;
@@ -303,7 +334,13 @@ fn obfuscate_python_fstring_expressions(content: &str, map: &BTreeMap<String, St
 
             if j < chars.len() && chars[j] == '}' {
                 let expr: String = chars[i + 1..j].iter().collect();
-                let expr_obf = apply_rules(&expr, map, Language::Python, &BTreeSet::new());
+                let expr_obf = apply_rules(
+                    &expr,
+                    map,
+                    Language::Python,
+                    &BTreeSet::new(),
+                    python_dataclass_index,
+                );
                 out.push('{');
                 out.push_str(&expr_obf);
                 out.push('}');
@@ -363,6 +400,281 @@ fn is_python_keyword_argument_label(text: &str, start: usize, end: usize, lang: 
 
     let prev = text[..start].chars().rev().find(|c| !c.is_whitespace());
     matches!(prev, Some('(' | ','))
+}
+
+#[derive(Default)]
+struct PythonDataclassIndex {
+    classes: BTreeSet<String>,
+    fields_by_class: BTreeMap<String, BTreeSet<String>>,
+    bases_by_class: BTreeMap<String, Vec<String>>,
+}
+
+impl PythonDataclassIndex {
+    fn class_has_field(&self, class_name: &str, field: &str) -> bool {
+        let mut visited = BTreeSet::new();
+        self.class_has_field_recursive(class_name, field, &mut visited)
+    }
+
+    fn class_has_field_recursive(
+        &self,
+        class_name: &str,
+        field: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
+        if !visited.insert(class_name.to_string()) {
+            return false;
+        }
+        if self
+            .fields_by_class
+            .get(class_name)
+            .is_some_and(|fields| fields.contains(field))
+        {
+            return true;
+        }
+        self.bases_by_class.get(class_name).is_some_and(|bases| {
+            bases
+                .iter()
+                .any(|base| self.class_has_field_recursive(base, field, visited))
+        })
+    }
+}
+
+fn collect_python_dataclass_index(files: &[FileEntry]) -> PythonDataclassIndex {
+    let mut out = PythonDataclassIndex::default();
+    for file in files {
+        if !matches!(detect_language(&file.rel, &file.text), Language::Python) {
+            continue;
+        }
+        collect_python_dataclass_index_from_text(&file.text, &mut out);
+    }
+    out
+}
+
+fn collect_python_dataclass_index_from_text(text: &str, out: &mut PythonDataclassIndex) {
+    let class_re = Regex::new(r"^([ \t]*)class\s+([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]*)\))?\s*:")
+        .expect("regex");
+    let field_re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:").expect("regex");
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut i = 0;
+    let mut saw_dataclass_decorator = false;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with('@') {
+            if is_dataclass_decorator(trimmed) {
+                saw_dataclass_decorator = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(cap) = class_re.captures(line) {
+            let class_indent = cap.get(1).map(|m| m.as_str().len()).unwrap_or_default();
+            let class_name = cap
+                .get(2)
+                .map(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            if saw_dataclass_decorator {
+                out.classes.insert(class_name.clone());
+                let bases =
+                    parse_python_base_classes(cap.get(3).map(|m| m.as_str()).unwrap_or_default());
+                if !bases.is_empty() {
+                    out.bases_by_class.insert(class_name.clone(), bases);
+                }
+                let (fields, next_i) =
+                    collect_python_dataclass_fields(&lines, i + 1, class_indent, &field_re);
+                out.fields_by_class
+                    .entry(class_name)
+                    .or_default()
+                    .extend(fields);
+                saw_dataclass_decorator = false;
+                i = next_i;
+                continue;
+            }
+
+            saw_dataclass_decorator = false;
+            i += 1;
+            continue;
+        }
+
+        if !trimmed.is_empty() {
+            saw_dataclass_decorator = false;
+        }
+        i += 1;
+    }
+}
+
+fn is_dataclass_decorator(trimmed_line: &str) -> bool {
+    let Some(rest) = trimmed_line.strip_prefix('@') else {
+        return false;
+    };
+    let decorator = rest
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    matches!(decorator, "dataclass" | "dataclasses.dataclass")
+}
+
+fn parse_python_base_classes(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|part| {
+            let mut candidate = part.trim();
+            if candidate.is_empty() {
+                return None;
+            }
+            if let Some(idx) = candidate.find('[') {
+                candidate = &candidate[..idx];
+            }
+            if let Some(idx) = candidate.find('(') {
+                candidate = &candidate[..idx];
+            }
+            let name = candidate.rsplit('.').next().unwrap_or_default().trim();
+            if is_plain_identifier(name) {
+                return Some(name.to_string());
+            }
+            None
+        })
+        .collect()
+}
+
+fn collect_python_dataclass_fields(
+    lines: &[&str],
+    start_idx: usize,
+    class_indent: usize,
+    field_re: &Regex,
+) -> (BTreeSet<String>, usize) {
+    let mut out = BTreeSet::new();
+    let mut i = start_idx;
+    let mut direct_body_indent = None;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        if indent <= class_indent {
+            break;
+        }
+
+        if direct_body_indent.is_none() {
+            direct_body_indent = Some(indent);
+        }
+
+        if direct_body_indent == Some(indent)
+            && let Some(cap) = field_re.captures(line.trim_start())
+        {
+            let field = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+            if !matches!(field, "self" | "cls") {
+                out.insert(field.to_string());
+            }
+        }
+
+        i += 1;
+    }
+
+    (out, i)
+}
+
+fn should_preserve_python_keyword_argument_label(
+    text: &str,
+    start: usize,
+    end: usize,
+    token: &str,
+    lang: Language,
+    python_dataclass_index: &PythonDataclassIndex,
+) -> bool {
+    if !is_python_keyword_argument_label(text, start, end, lang) {
+        return false;
+    }
+    !is_python_dataclass_keyword_argument_label(text, start, token, lang, python_dataclass_index)
+}
+
+fn is_python_dataclass_keyword_argument_label(
+    text: &str,
+    start: usize,
+    token: &str,
+    lang: Language,
+    python_dataclass_index: &PythonDataclassIndex,
+) -> bool {
+    if !matches!(lang, Language::Python) {
+        return false;
+    }
+    let Some(call_name) = find_enclosing_call_name(text, start) else {
+        return false;
+    };
+    python_dataclass_index.class_has_field(&call_name, token)
+}
+
+fn find_enclosing_call_name(text: &str, token_start: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = token_start;
+    let mut depth = 0usize;
+
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' => {
+                if depth == 0 {
+                    return find_call_name_before_paren(text, i);
+                }
+                depth -= 1;
+            }
+            b'[' | b'{' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_call_name_before_paren(text: &str, open_paren_idx: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut end = open_paren_idx;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let mut start = end;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+            start -= 1;
+            continue;
+        }
+        break;
+    }
+
+    let expr = &text[start..end];
+    let name = expr.rsplit('.').next().unwrap_or_default().trim();
+    if is_plain_identifier(name) {
+        return Some(name.to_string());
+    }
+    None
+}
+
+fn is_plain_identifier(token: &str) -> bool {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_ident_start(first) {
+        return false;
+    }
+    chars.all(is_ident_continue)
 }
 
 fn looks_like_sql(content: &str) -> bool {
@@ -1017,6 +1329,61 @@ print(profile.name)
         assert!(out[0].1.contains("def py_method_A1(user_name):"));
         assert!(out[0].1.contains("return user_name"));
         assert!(out[0].1.contains("py_method_A1(user_name='x')"));
+    }
+
+    #[test]
+    fn obfuscates_dataclass_constructor_keyword_labels() {
+        let map = BTreeMap::from([
+            ("CategoryUser".to_string(), "PyClass_A1".to_string()),
+            ("project".to_string(), "py_field_A1".to_string()),
+            ("project_user_id".to_string(), "py_field_B1".to_string()),
+            ("cards".to_string(), "py_field_C1".to_string()),
+            ("code".to_string(), "py_field_D1".to_string()),
+            ("category_id".to_string(), "py_field_E1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "from dataclasses import dataclass\n\n@dataclass\nclass User:\n    project: str = \"\"\n    project_user_id: str = \"\"\n    cards: str = \"\"\n    code: str = \"\"\n\n@dataclass\nclass CategoryUser(User):\n    category_id: int = 0\n\nCategoryUser(\n    project=self.project,\n    project_user_id=payload[\"user_id\"],\n    cards=payload[\"cards\"],\n    code=payload[\"code\"],\n    category_id=self.category_id,\n)\n"
+                .into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("PyClass_A1("));
+        assert!(out[0].1.contains("py_field_A1=self.project"));
+        assert!(out[0].1.contains("py_field_B1=payload[\"user_id\"]"));
+        assert!(out[0].1.contains("py_field_C1=payload[\"cards\"]"));
+        assert!(out[0].1.contains("py_field_D1=payload[\"code\"]"));
+        assert!(out[0].1.contains("py_field_E1=self.category_id"));
+    }
+
+    #[test]
+    fn keeps_external_base_fields_in_dataclass_constructor_labels() {
+        let map = BTreeMap::from([
+            ("CategoryUser".to_string(), "PyClass_A1".to_string()),
+            ("project".to_string(), "py_field_A1".to_string()),
+            ("project_user_id".to_string(), "py_field_B1".to_string()),
+            ("user_id".to_string(), "py_field_C1".to_string()),
+            ("category_id".to_string(), "py_field_D1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "from dataclasses import dataclass\nfrom apiutil.models import User\n\n@dataclass\nclass MidUser(User):\n    user_id: str = \"\"\n\n@dataclass\nclass CategoryUser(MidUser):\n    category_id: int = 0\n\nCategoryUser(\n    project=self.project,\n    project_user_id=payload[\"project_user_id\"],\n    user_id=payload[\"user_id\"],\n    category_id=self.category_id,\n)\n"
+                .into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("from apiutil.models import User"));
+        assert!(out[0].1.contains("class MidUser(User):"));
+        assert!(out[0].1.contains("class PyClass_A1(MidUser):"));
+        assert!(out[0].1.contains("PyClass_A1("));
+        assert!(out[0].1.contains("project=self.project"));
+        assert!(
+            out[0]
+                .1
+                .contains("project_user_id=payload[\"project_user_id\"]")
+        );
+        assert!(out[0].1.contains("py_field_C1=payload[\"user_id\"]"));
+        assert!(out[0].1.contains("py_field_D1=self.category_id"));
     }
 
     #[test]

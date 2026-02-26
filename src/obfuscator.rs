@@ -129,6 +129,7 @@ fn apply_rules(
             if let Some(mapped) = map.get(token)
                 && !is_reserved_identifier(token)
                 && !is_keyword(lang, token)
+                && !is_sql_built_in_function(token, lang)
                 && !is_python_builtin_identifier(token, lang)
                 && !globally_imported_python_symbols.contains(token)
                 && !is_python_import_path_token(text, start, i, lang)
@@ -140,6 +141,7 @@ fn apply_rules(
 
             if is_reserved_identifier(token)
                 || is_keyword(lang, token)
+                || is_sql_built_in_function(token, lang)
                 || is_python_builtin_identifier(token, lang)
                 || is_python_def_parameter(text, start, lang)
                 || is_python_keyword_argument_label(text, start, i, lang)
@@ -576,7 +578,44 @@ fn is_reserved_identifier(token: &str) -> bool {
                 | "CREATE"
                 | "TABLE"
                 | "VIEW"
+                | "DISTINCT"
+                | "ARRAY_AGG"
+                | "COUNT"
+                | "SUM"
+                | "MIN"
+                | "MAX"
+                | "AVG"
+                | "GROUP_CONCAT"
+                | "COALESCE"
+                | "NOW"
+                | "CURRENT_DATE"
+                | "CURRENT_TIMESTAMP"
         )
+}
+
+fn is_sql_built_in_function(token: &str, lang: Language) -> bool {
+    if !matches!(lang, Language::Sql) {
+        return false;
+    }
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "distinct"
+            | "array_agg"
+            | "count"
+            | "sum"
+            | "min"
+            | "max"
+            | "avg"
+            | "group_concat"
+            | "coalesce"
+            | "ifnull"
+            | "nvl"
+            | "date_trunc"
+            | "to_start_of_month"
+            | "now"
+            | "current_date"
+            | "current_timestamp"
+    )
 }
 
 fn is_python_builtin_identifier(token: &str, lang: Language) -> bool {
@@ -1014,6 +1053,30 @@ mod tests {
             out[0].1,
             "SELECT r.a1, b1, c1 FROM test666 r WHERE r.a1 > 0"
         );
+    }
+
+    #[test]
+    fn sql_keeps_keywords_and_common_aggregates() {
+        let map = BTreeMap::from([
+            ("distinct".to_string(), "broken1".to_string()),
+            ("array_agg".to_string(), "broken2".to_string()),
+            ("count".to_string(), "broken3".to_string()),
+            ("orders".to_string(), "t_orders".to_string()),
+            ("user_id".to_string(), "u1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.sql".into(),
+            text: "SELECT DISTINCT user_id, ARRAY_AGG(user_id), COUNT(user_id) FROM orders".into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("SELECT DISTINCT"));
+        assert!(out[0].1.contains("ARRAY_AGG(u1)"));
+        assert!(out[0].1.contains("COUNT(u1)"));
+        assert!(out[0].1.contains("FROM t_orders"));
+        assert!(!out[0].1.contains("broken1"));
+        assert!(!out[0].1.contains("broken2"));
+        assert!(!out[0].1.contains("broken3"));
     }
 
     #[test]

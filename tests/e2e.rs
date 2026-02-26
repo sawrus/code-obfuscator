@@ -422,6 +422,61 @@ fn e2e_python_class_methods_are_consistently_obfuscated() {
     assert_eq!(rev_main, src_main);
 }
 
+#[test]
+fn e2e_mixed_project_python_sql_bash() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+
+    fs::create_dir_all(src.path().join("py")).expect("py");
+    fs::create_dir_all(src.path().join("sql")).expect("sql");
+    fs::create_dir_all(src.path().join("bash")).expect("bash");
+
+    fs::write(
+        src.path().join("py/main.py"),
+        "def run(user_ids):\n    return len(user_ids)\n",
+    )
+    .expect("write py");
+    fs::write(
+        src.path().join("sql/main.sql"),
+        "SELECT DISTINCT user_id, ARRAY_AGG(user_id) FROM users",
+    )
+    .expect("write sql");
+    fs::write(
+        src.path().join("bash/main.sh"),
+        "#!/usr/bin/env bash\nuser_ids=\"1,2\"\necho \"$user_ids\"\n",
+    )
+    .expect("write bash");
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{"user_ids":"u_ids","user_id":"u1","users":"u_tbl"}"#,
+    )
+    .expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let py = fs::read_to_string(obf.path().join("py/main.py")).expect("py out");
+    let sql = fs::read_to_string(obf.path().join("sql/main.sql")).expect("sql out");
+    let sh = fs::read_to_string(obf.path().join("bash/main.sh")).expect("bash out");
+
+    assert!(py.contains("(u_ids):"));
+    assert!(sql.contains("SELECT DISTINCT u1"));
+    assert!(sql.contains("ARRAY_AGG(u1)"));
+    assert!(sql.contains("FROM u_tbl"));
+    assert!(sh.contains("u_ids="));
+}
+
 #[derive(Clone, Copy)]
 struct LanguageCase {
     folder: &'static str,

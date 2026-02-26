@@ -15,13 +15,78 @@ pub fn transform_files(
         .iter()
         .map(|f| {
             let lang = detect_language(&f.rel, &f.text);
+            let obfuscator = build_obfuscator(lang);
             (
                 f.rel.clone(),
-                apply_rules(&f.text, map, lang, &globally_imported_python_symbols),
+                obfuscator.apply(&f.text, map, &globally_imported_python_symbols),
             )
         })
         .collect())
 }
+
+trait LanguageObfuscator {
+    fn apply(
+        &self,
+        text: &str,
+        map: &BTreeMap<String, String>,
+        globally_imported_python_symbols: &BTreeSet<String>,
+    ) -> String;
+}
+
+fn build_obfuscator(lang: Language) -> Box<dyn LanguageObfuscator> {
+    match lang {
+        Language::Python => Box::new(PythonObfuscator),
+        Language::Sql => Box::new(SqlObfuscator),
+        Language::JavaScript => Box::new(JavaScriptObfuscator),
+        Language::TypeScript => Box::new(TypeScriptObfuscator),
+        Language::Java => Box::new(JavaObfuscator),
+        Language::CSharp => Box::new(CSharpObfuscator),
+        Language::CCpp => Box::new(CCppObfuscator),
+        Language::Go => Box::new(GoObfuscator),
+        Language::Rust => Box::new(RustObfuscator),
+        Language::Bash => Box::new(BashObfuscator),
+        Language::Unknown => Box::new(UnknownObfuscator),
+    }
+}
+
+struct PythonObfuscator;
+struct SqlObfuscator;
+struct JavaScriptObfuscator;
+struct TypeScriptObfuscator;
+struct JavaObfuscator;
+struct CSharpObfuscator;
+struct CCppObfuscator;
+struct GoObfuscator;
+struct RustObfuscator;
+struct BashObfuscator;
+struct UnknownObfuscator;
+
+macro_rules! impl_lang_obfuscator {
+    ($name:ident, $lang:expr) => {
+        impl LanguageObfuscator for $name {
+            fn apply(
+                &self,
+                text: &str,
+                map: &BTreeMap<String, String>,
+                globally_imported_python_symbols: &BTreeSet<String>,
+            ) -> String {
+                apply_rules(text, map, $lang, globally_imported_python_symbols)
+            }
+        }
+    };
+}
+
+impl_lang_obfuscator!(PythonObfuscator, Language::Python);
+impl_lang_obfuscator!(SqlObfuscator, Language::Sql);
+impl_lang_obfuscator!(JavaScriptObfuscator, Language::JavaScript);
+impl_lang_obfuscator!(TypeScriptObfuscator, Language::TypeScript);
+impl_lang_obfuscator!(JavaObfuscator, Language::Java);
+impl_lang_obfuscator!(CSharpObfuscator, Language::CSharp);
+impl_lang_obfuscator!(CCppObfuscator, Language::CCpp);
+impl_lang_obfuscator!(GoObfuscator, Language::Go);
+impl_lang_obfuscator!(RustObfuscator, Language::Rust);
+impl_lang_obfuscator!(BashObfuscator, Language::Bash);
+impl_lang_obfuscator!(UnknownObfuscator, Language::Unknown);
 
 fn apply_rules(
     text: &str,
@@ -494,6 +559,10 @@ fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Lang
         return false;
     }
 
+    if matches!(lang, Language::Python) && is_python_local_member_access_identifier(text, start) {
+        return false;
+    }
+
     let mut prev = None;
     for c in text[..start].chars().rev() {
         if c == '\n' || c == '\r' {
@@ -507,6 +576,35 @@ fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Lang
     }
 
     matches!(prev, Some('.' | ':' | '#'))
+}
+
+fn is_python_local_member_access_identifier(text: &str, start: usize) -> bool {
+    if start == 0 {
+        return false;
+    }
+
+    let prefix = &text[..start];
+    let trimmed = prefix.trim_end();
+    if !trimmed.ends_with('.') {
+        return false;
+    }
+
+    let owner = trimmed[..trimmed.len() - 1]
+        .trim_end()
+        .rsplit(|c: char| !is_ident_continue(c))
+        .next()
+        .unwrap_or_default();
+
+    if matches!(owner, "self" | "cls") {
+        return true;
+    }
+
+    let expr_start = prefix
+        .rfind(|c: char| matches!(c, '\n' | ';' | '='))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let expr = &prefix[expr_start..];
+    expr.contains("self.") || expr.contains("cls.")
 }
 
 fn is_non_python_import_line(text: &str, start: usize, lang: Language) -> bool {
@@ -1051,5 +1149,26 @@ print(profile.name)
         assert!(out[0].1.contains("os.environ.get('X')"));
         assert!(out[0].1.contains("pd.DataFrame()"));
         assert!(out[0].1.contains("[\"partner_id\"]"));
+    }
+
+    #[test]
+    fn obfuscates_python_class_methods_used_via_self_and_cls() {
+        let map = BTreeMap::from([
+            ("Service".to_string(), "ClassA1".to_string()),
+            ("make_value".to_string(), "method_a1".to_string()),
+            ("build".to_string(), "method_b1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "class Service:\n    def make_value(self):\n        return 1\n\n    @classmethod\n    def build(cls):\n        return cls()\n\n    def run(self):\n        return self.make_value() + self.build().make_value()\n"
+                .into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("class ClassA1:"));
+        assert!(out[0].1.contains("def method_a1(self):"));
+        assert!(out[0].1.contains("def method_b1(cls):"));
+        assert!(out[0].1.contains("self.method_a1()"));
+        assert!(out[0].1.contains("self.method_b1().method_a1()"));
     }
 }

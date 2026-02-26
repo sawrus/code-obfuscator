@@ -369,6 +369,59 @@ fn e2e_deep_obfuscation_mapping_for_other_languages() {
     }
 }
 
+#[test]
+fn e2e_python_class_methods_are_consistently_obfuscated() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+    let rev = tempdir().expect("rev");
+
+    fs::write(
+        src.path().join("main.py"),
+        "class Service:\n    def make_value(self):\n        return 1\n\n    @classmethod\n    def build(cls):\n        return cls()\n\n    def run(self):\n        return self.make_value() + self.build().make_value()\n",
+    )
+    .expect("write python");
+
+    let mapping = src.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{"Service":"ClassA1","make_value":"method_a1","build":"method_b1"}"#,
+    )
+    .expect("write map");
+
+    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    forward
+        .arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--mapping")
+        .arg(&mapping);
+    forward.assert().success();
+
+    let py = fs::read_to_string(obf.path().join("main.py")).expect("read py");
+    assert!(py.contains("class ClassA1:"));
+    assert!(py.contains("def method_a1(self):"));
+    assert!(py.contains("def method_b1(cls):"));
+    assert!(py.contains("self.method_a1()"));
+    assert!(py.contains("self.method_b1().method_a1()"));
+
+    let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    reverse
+        .arg("--mode")
+        .arg("reverse")
+        .arg("--source")
+        .arg(obf.path())
+        .arg("--target")
+        .arg(rev.path());
+    reverse.assert().success();
+
+    let rev_main = fs::read_to_string(rev.path().join("main.py")).expect("read rev main");
+    let src_main = fs::read_to_string(src.path().join("main.py")).expect("read src main");
+    assert_eq!(rev_main, src_main);
+}
+
 #[derive(Clone, Copy)]
 struct LanguageCase {
     folder: &'static str,

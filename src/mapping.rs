@@ -345,6 +345,9 @@ fn collect_identifier_kinds(files: &[FileEntry]) -> BTreeMap<String, IdentifierK
                         .entry(cap[1].to_string())
                         .or_insert(IdentifierKind::PyField);
                 }
+                for field in collect_python_dataclass_field_names(&file.text) {
+                    kinds.entry(field).or_insert(IdentifierKind::PyField);
+                }
                 for ident in ident_re.find_iter(&file.text).map(|m| m.as_str()) {
                     if ident.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
                         kinds
@@ -384,6 +387,103 @@ fn collect_identifier_kinds(files: &[FileEntry]) -> BTreeMap<String, IdentifierK
     }
 
     kinds
+}
+
+fn collect_python_dataclass_field_names(text: &str) -> BTreeSet<String> {
+    let class_re =
+        Regex::new(r"^([ \t]*)class\s+[A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?\s*:").expect("regex");
+    let field_re = Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:").expect("regex");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = BTreeSet::new();
+
+    let mut i = 0;
+    let mut saw_dataclass_decorator = false;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with('@') {
+            if is_dataclass_decorator(trimmed) {
+                saw_dataclass_decorator = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(cap) = class_re.captures(line) {
+            let class_indent = cap.get(1).map(|m| m.as_str().len()).unwrap_or_default();
+            if saw_dataclass_decorator {
+                let (fields, next_i) =
+                    collect_python_dataclass_fields(&lines, i + 1, class_indent, &field_re);
+                out.extend(fields);
+                i = next_i;
+                saw_dataclass_decorator = false;
+                continue;
+            }
+            saw_dataclass_decorator = false;
+            i += 1;
+            continue;
+        }
+
+        if !trimmed.is_empty() {
+            saw_dataclass_decorator = false;
+        }
+        i += 1;
+    }
+
+    out
+}
+
+fn collect_python_dataclass_fields(
+    lines: &[&str],
+    start_idx: usize,
+    class_indent: usize,
+    field_re: &Regex,
+) -> (BTreeSet<String>, usize) {
+    let mut out = BTreeSet::new();
+    let mut i = start_idx;
+    let mut direct_body_indent = None;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        if indent <= class_indent {
+            break;
+        }
+
+        if direct_body_indent.is_none() {
+            direct_body_indent = Some(indent);
+        }
+        if direct_body_indent == Some(indent)
+            && let Some(cap) = field_re.captures(line.trim_start())
+        {
+            let field = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+            if !matches!(field, "self" | "cls") {
+                out.insert(field.to_string());
+            }
+        }
+
+        i += 1;
+    }
+
+    (out, i)
+}
+
+fn is_dataclass_decorator(trimmed_line: &str) -> bool {
+    let Some(rest) = trimmed_line.strip_prefix('@') else {
+        return false;
+    };
+    let decorator = rest
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    matches!(decorator, "dataclass" | "dataclasses.dataclass")
 }
 
 #[cfg(test)]
@@ -581,6 +681,10 @@ mod tests {
                     .into(),
             },
             FileEntry {
+                rel: "dataclass_case.py".into(),
+                text: "@dataclass\nclass CategoryUser:\n    project_user_id: str = \"\"\n".into(),
+            },
+            FileEntry {
                 rel: "main.sql".into(),
                 text: "SELECT * FROM my_schema.refill\n".into(),
             },
@@ -595,6 +699,7 @@ mod tests {
             "User".to_string(),
             "get_cats".to_string(),
             "tag".to_string(),
+            "project_user_id".to_string(),
             "CONST_A".to_string(),
             "my_schema".to_string(),
             "refill".to_string(),
@@ -609,6 +714,11 @@ mod tests {
                 .starts_with("py_method_")
         );
         assert!(map.get("tag").expect("tag").starts_with("py_field_"));
+        assert!(
+            map.get("project_user_id")
+                .expect("project_user_id")
+                .starts_with("py_field_")
+        );
         assert!(
             map.get("CONST_A")
                 .expect("CONST_A")

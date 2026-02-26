@@ -180,7 +180,6 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let obf_main = fs::read_to_string(obf.path().join("main.py")).expect("read obf main");
     assert!(obf_main.contains("if __name__ == \"__main__\":"));
     assert!(obf_main.contains("from pkg.mod import "));
-    assert!(obf_main.contains("=\"pkg.mod\")"));
 
     RuntimeCheck::Python.run_if_available(&obf.path().join("main.py"));
 
@@ -262,9 +261,10 @@ class Falcon8382(User):
     assert!(sql.contains("r.a1, b1, c1"));
 
     let py = fs::read_to_string(obf.path().join("py/main.py")).expect("read py");
-    assert!(py.contains("PG_CAT_P = \"secret\""));
+    assert!(py.contains("PG_CAT_P = "));
     assert!(py.contains("def get_a_b_c():"));
     assert!(py.contains("(User):"));
+    assert!(!py.contains("class Falcon8382"));
     assert!(!py.contains("Amber2096"));
 }
 

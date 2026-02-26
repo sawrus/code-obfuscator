@@ -10,7 +10,8 @@ pub fn transform_files(
     files: &[FileEntry],
     map: &BTreeMap<String, String>,
 ) -> AppResult<Vec<(PathBuf, String)>> {
-    let globally_imported_python_symbols = collect_python_imported_symbols_from_files(files);
+    let globally_imported_python_symbols =
+        collect_python_external_imported_symbols_from_files(files);
     Ok(files
         .iter()
         .map(|f| {
@@ -99,20 +100,16 @@ fn apply_rules(
     } else {
         BTreeSet::new()
     };
-    let python_parameters = if matches!(lang, Language::Python) {
-        collect_python_parameter_names(text)
-    } else {
-        BTreeSet::new()
-    };
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
         if let Some((next, segment, kind)) = scan_string_or_comment(text, i, lang) {
-            if matches!(kind, SegmentKind::String) {
-                out.push_str(&maybe_obfuscate_sql_in_string(segment, map, lang));
+            let transformed_segment = if matches!(kind, SegmentKind::String) {
+                maybe_obfuscate_sql_in_string(segment, map, lang)
             } else {
-                out.push_str(segment);
-            }
+                segment.to_string()
+            };
+            out.push_str(&replace_mapped_identifiers(&transformed_segment, map));
             i = next;
             continue;
         }
@@ -129,13 +126,24 @@ fn apply_rules(
                 i += c.len_utf8();
             }
             let token = &text[start..i];
+            if let Some(mapped) = map.get(token)
+                && !is_reserved_identifier(token)
+                && !is_keyword(lang, token)
+                && !is_python_builtin_identifier(token, lang)
+                && !globally_imported_python_symbols.contains(token)
+                && !is_python_import_path_token(text, start, i, lang)
+                && !is_member_access_identifier(text, start, i, lang)
+            {
+                out.push_str(mapped);
+                continue;
+            }
+
             if is_reserved_identifier(token)
                 || is_keyword(lang, token)
                 || is_python_builtin_identifier(token, lang)
                 || is_python_def_parameter(text, start, lang)
                 || is_python_keyword_argument_label(text, start, i, lang)
                 || python_imports.contains(token)
-                || python_parameters.contains(token)
                 || globally_imported_python_symbols.contains(token)
                 || is_javascript_camel_case_identifier(token, lang)
                 || is_python_import_line(text, start, lang)
@@ -153,6 +161,34 @@ fn apply_rules(
         out.push(ch);
         i += ch.len_utf8();
     }
+    out
+}
+
+fn replace_mapped_identifiers(text: &str, map: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < text.len() {
+        let ch = text[i..].chars().next().expect("char");
+        if is_ident_start(ch) {
+            let start = i;
+            i += ch.len_utf8();
+            while i < text.len() {
+                let c = text[i..].chars().next().expect("char");
+                if !is_ident_continue(c) {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+            let token = &text[start..i];
+            out.push_str(map.get(token).map(|s| s.as_str()).unwrap_or(token));
+            continue;
+        }
+
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
     out
 }
 
@@ -564,7 +600,8 @@ fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Lang
     }
 
     let mut prev = None;
-    for c in text[..start].chars().rev() {
+    let mut prev_idx = 0usize;
+    for (idx, c) in text[..start].char_indices().rev() {
         if c == '\n' || c == '\r' {
             break;
         }
@@ -572,10 +609,15 @@ fn is_member_access_identifier(text: &str, start: usize, _end: usize, lang: Lang
             continue;
         }
         prev = Some(c);
+        prev_idx = idx;
         break;
     }
 
-    matches!(prev, Some('.' | ':' | '#'))
+    match prev {
+        Some('.') | Some('#') => true,
+        Some(':') => text[..prev_idx].chars().rev().find(|c| !c.is_whitespace()) == Some(':'),
+        _ => false,
+    }
 }
 
 fn is_python_local_member_access_identifier(text: &str, start: usize) -> bool {
@@ -640,12 +682,44 @@ fn is_non_python_import_line(text: &str, start: usize, lang: Language) -> bool {
     }
 }
 
-fn collect_python_imported_symbols_from_files(files: &[FileEntry]) -> BTreeSet<String> {
-    files
+fn collect_python_external_imported_symbols_from_files(files: &[FileEntry]) -> BTreeSet<String> {
+    let declared = collect_python_declared_symbols_from_files(files);
+    let imported: BTreeSet<String> = files
         .iter()
         .filter(|f| matches!(detect_language(&f.rel, &f.text), Language::Python))
         .flat_map(|f| collect_python_imported_symbols(&f.text).into_iter())
+        .collect();
+
+    imported
+        .into_iter()
+        .filter(|symbol| !declared.contains(symbol))
         .collect()
+}
+
+fn collect_python_declared_symbols_from_files(files: &[FileEntry]) -> BTreeSet<String> {
+    files
+        .iter()
+        .filter(|f| matches!(detect_language(&f.rel, &f.text), Language::Python))
+        .flat_map(|f| collect_python_declared_symbols(&f.text).into_iter())
+        .collect()
+}
+
+fn collect_python_declared_symbols(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let class_re = Regex::new(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)").expect("regex");
+    let def_re = Regex::new(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("regex");
+
+    out.extend(
+        class_re
+            .captures_iter(text)
+            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string())),
+    );
+    out.extend(
+        def_re
+            .captures_iter(text)
+            .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string())),
+    );
+    out
 }
 
 fn collect_python_imported_symbols(text: &str) -> BTreeSet<String> {
@@ -672,24 +746,6 @@ fn collect_python_imported_symbols(text: &str) -> BTreeSet<String> {
             }
         }
     }
-    out
-}
-
-fn collect_python_parameter_names(text: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let def_re = Regex::new(r"\bdef\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)").expect("regex");
-    let ident_re = Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("regex");
-
-    for cap in def_re.captures_iter(text) {
-        let params = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-        for ident in ident_re.find_iter(params).map(|m| m.as_str()) {
-            if matches!(ident, "self" | "cls") {
-                continue;
-            }
-            out.insert(ident.to_string());
-        }
-    }
-
     out
 }
 
@@ -905,23 +961,17 @@ mod tests {
     }
 
     #[test]
-    fn does_not_replace_strings_comments_or_magic_names() {
+    fn applies_mapping_inside_strings_and_comments_with_high_priority() {
         let mut map = BTreeMap::new();
-        map.insert("module_path".into(), "Shadow".into());
-        map.insert("run_task".into(), "Launch".into());
-        map.insert("__name__".into(), "Broken".into());
+        map.insert("Turkey".into(), "T1".into());
+        map.insert("tag_name".into(), "tag_obf".into());
         let f = vec![FileEntry {
             rel: "main.py".into(),
-            text: "if __name__ == \"__main__\":\n    from module_path import run_task\n    run_task(module_path=\"module_path\")\n".into(),
+            text: "# Tag \"Turkey\"\ntag_name = \"Turkey\"\n".into(),
         }];
         let out = transform_files(&f, &map).expect("transform");
-        assert!(
-            out[0]
-                .1
-                .contains("if __name__ == \"__main__\":\n    from module_path import")
-        );
-        assert!(out[0].1.contains("run_task("));
-        assert!(out[0].1.contains("=\"module_path\")"));
+        assert!(out[0].1.contains("# Tag \"T1\""));
+        assert!(out[0].1.contains("tag_obf = \"T1\""));
     }
 
     #[test]
@@ -1058,7 +1108,7 @@ print(profile.name)
         assert!(out[0].1.contains("in s1:"));
     }
     #[test]
-    fn does_not_obfuscate_non_sql_strings() {
+    fn replaces_non_sql_strings_when_mapping_contains_identifier() {
         let mut map = BTreeMap::new();
         map.insert("table1".into(), "t1".into());
 
@@ -1068,7 +1118,7 @@ print(profile.name)
         }];
 
         let out = transform_files(&files, &map).expect("transform");
-        assert!(out[0].1.contains("table1 should stay in plain text"));
+        assert!(out[0].1.contains("t1 should stay in plain text"));
     }
 
     #[test]
@@ -1101,7 +1151,7 @@ print(profile.name)
     }
 
     #[test]
-    fn keeps_python_named_argument_labels_and_params_unmodified() {
+    fn obfuscates_python_named_argument_labels_when_present_in_mapping() {
         let map = BTreeMap::from([
             ("user_name".to_string(), "py_var_A1".to_string()),
             ("greet".to_string(), "py_method_A1".to_string()),
@@ -1112,9 +1162,9 @@ print(profile.name)
         }];
 
         let out = transform_files(&files, &map).expect("transform");
-        assert!(out[0].1.contains("def py_method_A1(user_name):"));
-        assert!(out[0].1.contains("return user_name"));
-        assert!(out[0].1.contains("py_method_A1(user_name='x')"));
+        assert!(out[0].1.contains("def py_method_A1(py_var_A1):"));
+        assert!(out[0].1.contains("return py_var_A1"));
+        assert!(out[0].1.contains("py_method_A1(py_var_A1='x')"));
     }
 
     #[test]
@@ -1148,7 +1198,7 @@ print(profile.name)
         let out = transform_files(&files, &map).expect("transform");
         assert!(out[0].1.contains("os.environ.get('X')"));
         assert!(out[0].1.contains("pd.DataFrame()"));
-        assert!(out[0].1.contains("[\"partner_id\"]"));
+        assert!(out[0].1.contains("[\"py_var_B2\"]"));
     }
 
     #[test]
@@ -1170,5 +1220,47 @@ print(profile.name)
         assert!(out[0].1.contains("def method_b1(cls):"));
         assert!(out[0].1.contains("self.method_a1()"));
         assert!(out[0].1.contains("self.method_b1().method_a1()"));
+    }
+
+    #[test]
+    fn obfuscates_local_python_class_imports_and_constructor_kwargs() {
+        let map = BTreeMap::from([
+            ("CategoryUser".to_string(), "py_class_A1".to_string()),
+            ("project_user_id".to_string(), "py_field_U1".to_string()),
+        ]);
+        let files = vec![
+            FileEntry {
+                rel: "models.py".into(),
+                text: "class CategoryUser:\n    project_user_id: str\n".into(),
+            },
+            FileEntry {
+                rel: "main.py".into(),
+                text:
+                    "from models import CategoryUser\n\nobj = CategoryUser(project_user_id='1')\n"
+                        .into(),
+            },
+        ];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("class py_class_A1:"));
+        assert!(out[1].1.contains("from models import py_class_A1"));
+        assert!(out[1].1.contains("obj = py_class_A1(py_field_U1='1')"));
+    }
+
+    #[test]
+    fn obfuscates_python_method_locals_used_in_kwargs() {
+        let map = BTreeMap::from([
+            ("user_ids".to_string(), "py_var_V6".to_string()),
+            ("params".to_string(), "py_var_P1".to_string()),
+        ]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "def f(users):\n    user_ids = [u.id for u in users]\n    return call(params={\"user_ids\": user_ids})\n"
+                .into(),
+        }];
+
+        let out = transform_files(&files, &map).expect("transform");
+        assert!(out[0].1.contains("py_var_V6 = [u.id for u in users]"));
+        assert!(out[0].1.contains("py_var_P1={\"py_var_V6\": py_var_V6}"));
     }
 }

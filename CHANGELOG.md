@@ -1,15 +1,23 @@
 # Changelog
 
+## [0.4.0] - 2026-02-27
+
+### Added
+- English changelog entries for recent releases.
+
+### Changed
+- Package version bumped to `0.4.0`.
+
 ## [0.3.0] - 2026-02-24
 
 ### Added
-- Дополнительные unit-тесты, подтверждающие глубокую обфускацию идентификаторов в JavaScript, TypeScript, Java и Go.
-- Новый e2e-сценарий с явным `mapping.json`, проверяющий замену идентификаторов в JavaScript, TypeScript, Java, C#, C++, Go, Rust и Bash.
-- Расширение SVT-проверки: mixed-language нагрузочный тест теперь валидирует фактическую замену по mapping на выходных файлах.
+- Additional unit tests validating deep identifier obfuscation in JavaScript, TypeScript, Java, and Go.
+- A new e2e scenario with an explicit `mapping.json` that verifies identifier replacement in JavaScript, TypeScript, Java, C#, C++, Go, Rust, and Bash.
+- Extended SVT coverage: the mixed-language stress test now validates actual mapping-driven replacements in output files.
 
 ### Changed
-- Версия пакета поднята до `0.3.0`.
-- README очищен от пользовательских приватных примеров и оставляет только общие формулировки возможностей.
+- Package version bumped to `0.3.0`.
+- README cleaned up to remove user-specific private examples and keep only general capability descriptions.
 
 ## [0.2.0] - 2026-02-23
 

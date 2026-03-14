@@ -38,6 +38,9 @@ fn validate(args: &Args) -> AppResult<()> {
     if !args.source.is_dir() {
         return err("source must be a directory");
     }
+    if matches!(args.mode, Mode::Forward) && !args.deep && args.mapping.is_none() {
+        return err("mapping is required in forward mode unless --deep is set");
+    }
     Ok(())
 }
 
@@ -47,6 +50,11 @@ fn err(msg: &str) -> AppResult<()> {
 
 fn forward(args: &Args) -> AppResult<()> {
     let files = fs_ops::read_text_tree(&args.source)?;
+    if !args.deep {
+        let map = load_manual(args.mapping.as_deref())?;
+        return apply_and_save(args, files, map);
+    }
+
     let mut map = load_manual(args.mapping.as_deref())?;
     let terms = detect_terms(&files)?;
     merge_ai(args, &terms, &mut map)?;
@@ -82,7 +90,11 @@ fn apply_and_save(
     files: Vec<fs_ops::FileEntry>,
     map: BTreeMap<String, String>,
 ) -> AppResult<()> {
-    let transformed = obfuscator::transform_files(&files, &map)?;
+    let transformed = if args.deep {
+        obfuscator::transform_files(&files, &map)?
+    } else {
+        obfuscator::transform_files_global(&files, &map)?
+    };
     fs_ops::write_text_tree(&args.target, &transformed)?;
     let path = output_map_path(args);
     save_mapping(&path, &map)?;
@@ -94,7 +106,11 @@ fn reverse(args: &Args) -> AppResult<()> {
     let path = input_map_path(args)?;
     let map_file = load_mapping(&path)?;
     let files = fs_ops::read_text_tree(&args.source)?;
-    let transformed = obfuscator::transform_files(&files, &map_file.reverse)?;
+    let transformed = if args.deep {
+        obfuscator::transform_files(&files, &map_file.reverse)?
+    } else {
+        obfuscator::transform_files_global(&files, &map_file.reverse)?
+    };
     fs_ops::write_text_tree(&args.target, &transformed)?;
     print_stats(files.len(), &map_file.reverse, &path);
     Ok(())

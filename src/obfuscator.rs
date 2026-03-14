@@ -6,6 +6,26 @@ use crate::error::AppResult;
 use crate::fs_ops::FileEntry;
 use crate::language::{Language, detect_language, is_keyword};
 
+pub fn transform_files_global(
+    files: &[FileEntry],
+    map: &BTreeMap<String, String>,
+) -> AppResult<Vec<(PathBuf, String)>> {
+    Ok(files
+        .iter()
+        .map(|f| (f.rel.clone(), apply_global_mapping(&f.text, map)))
+        .collect())
+}
+
+fn apply_global_mapping(text: &str, map: &BTreeMap<String, String>) -> String {
+    let mut out = text.to_string();
+    for (from, to) in map {
+        let pattern = format!(r"\b{}\b", regex::escape(from));
+        let re = Regex::new(&pattern).expect("valid regex");
+        out = re.replace_all(&out, to.as_str()).into_owned();
+    }
+    out
+}
+
 pub fn transform_files(
     files: &[FileEntry],
     map: &BTreeMap<String, String>,
@@ -1105,6 +1125,34 @@ fn is_python_import_path_token(text: &str, start: usize, end: usize, lang: Langu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_mode_preserves_python_import_path_but_global_mode_replaces_it() {
+        let map = BTreeMap::from([("pkg".to_string(), "xpkg".to_string())]);
+        let files = vec![FileEntry {
+            rel: "main.py".into(),
+            text: "from pkg.mod import greet\nprint(pkg)\n".into(),
+        }];
+
+        let deep = transform_files(&files, &map).expect("deep transform");
+        assert!(deep[0].1.contains("from pkg.mod import greet"));
+        assert!(deep[0].1.contains("print(xpkg)"));
+
+        let global = transform_files_global(&files, &map).expect("global transform");
+        assert!(global[0].1.contains("from xpkg.mod import greet"));
+        assert!(global[0].1.contains("print(xpkg)"));
+    }
+
+    #[test]
+    fn global_mode_replaces_in_strings_and_comments() {
+        let map = BTreeMap::from([("run_task".to_string(), "Launch".to_string())]);
+        let f = vec![FileEntry {
+            rel: "a.py".into(),
+            text: "# run_task\nprint(\"run_task\")\nrun_task()".into(),
+        }];
+        let out = transform_files_global(&f, &map).expect("transform");
+        assert_eq!(out[0].1, "# Launch\nprint(\"Launch\")\nLaunch()");
+    }
 
     #[test]
     fn replaces_only_whole_words() {

@@ -65,6 +65,47 @@ fn fails_without_mapping_in_reverse_mode() {
 }
 
 #[test]
+fn fails_without_mapping_in_forward_mode_by_default() {
+    let src = tempdir().expect("src");
+    let out = tempdir().expect("out");
+    fs::write(src.path().join("main.py"), "print('ok')\n").expect("write");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(out.path());
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "mapping is required in forward mode unless --deep is set",
+    ));
+}
+
+#[test]
+fn forward_with_deep_without_mapping_succeeds() {
+    let src = tempdir().expect("src");
+    let obf = tempdir().expect("obf");
+    fs::write(
+        src.path().join("main.py"),
+        "def run_task(user_id):\n    return user_id + 1\n",
+    )
+    .expect("write");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(obf.path())
+        .arg("--deep");
+    cmd.assert().success();
+
+    assert!(obf.path().join("mapping.generated.json").exists());
+}
+
+#[test]
 fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
     let languages = [
         LanguageCase::new("python", "main.py", RuntimeCheck::Python),
@@ -174,7 +215,8 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
         .arg("--target")
         .arg(obf.path())
         .arg("--seed")
-        .arg("7");
+        .arg("7")
+        .arg("--deep");
     forward.assert().success();
 
     let obf_main = fs::read_to_string(obf.path().join("main.py")).expect("read obf main");
@@ -254,7 +296,8 @@ class Falcon8382(User):
         .arg("--target")
         .arg(obf.path())
         .arg("--mapping")
-        .arg(&mapping);
+        .arg(&mapping)
+        .arg("--deep");
     forward.assert().success();
 
     let sql = fs::read_to_string(obf.path().join("sql/main.sql")).expect("read sql");

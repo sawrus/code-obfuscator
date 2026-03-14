@@ -21,6 +21,8 @@ pub struct Args {
     pub mapping: Option<PathBuf>,
     #[arg(long)]
     pub output_mapping: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    pub deep: bool,
     #[arg(long)]
     pub ollama_url: Option<String>,
     #[arg(long)]

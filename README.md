@@ -80,6 +80,76 @@ make build
 
 Если заданы `--ollama-url` и `--ollama-model`, утилита отправляет часть language-aware обнаруженных терминов в Ollama и добавляет валидные ответы в карту замен.
 
+
+## MCP server (stdio)
+
+В проекте добавлен отдельный MCP-серверный бинарник `mcp-server`, который реализует flow:
+
+1. `obfuscate_project` — обфускация дерева текстовых файлов перед отправкой в LLM (без `--deep`).
+2. `deobfuscate_project` — обратное восстановление результата LLM по `mapping_payload`.
+
+Запуск:
+
+```bash
+cargo run --bin mcp-server
+```
+
+Сервер работает по MCP/JSON-RPC через `stdio` (`Content-Length` framing) и экспортирует tools:
+- `obfuscate_project`
+- `deobfuscate_project`
+
+### Запуск MCP через Docker
+
+Сборка и запуск из Docker:
+
+```bash
+make mcp-docker-run
+```
+
+Или напрямую:
+
+```bash
+./scripts/run-mcp-docker.sh
+```
+
+Также доступны отдельные шаги:
+
+```bash
+make mcp-docker-build
+docker run --rm -i code-obfuscator-mcp:local
+```
+
+### Подключение локального MCP в Codex CLI
+
+Добавьте сервер в конфиг Codex CLI (пример `~/.codex/config.toml`):
+
+```toml
+[mcp_servers.code_obfuscator]
+command = "docker"
+args = [
+  "run", "--rm", "-i",
+  "code-obfuscator-mcp:local"
+]
+```
+
+После этого перезапустите Codex CLI и проверьте, что сервер доступен в списке MCP-серверов.
+
+Если хотите запускать без Docker, можно указать бинарник напрямую:
+
+```toml
+[mcp_servers.code_obfuscator]
+command = "cargo"
+args = ["run", "--manifest-path", "/ABS/PATH/code-obfuscator/Cargo.toml", "--bin", "mcp-server"]
+```
+
+В такой конфигурации LLM (включая GPT-5.x в Codex CLI) будет вызывать инструменты `obfuscate_project`/`deobfuscate_project` через ваш локальный MCP-сервер.
+
+Ограничения текущей версии MCP:
+- только текстовые файлы (`path + content`),
+- stateless-модель (клиент передаёт mapping обратно),
+- fail-fast при деобфускации, если обязательные обфусцированные токены отсутствуют в ответе LLM,
+- `--deep` не используется.
+
 ## Makefile команды
 
 - `make build` - сборка.

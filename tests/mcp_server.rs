@@ -1,7 +1,12 @@
+use std::fs;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
+use tempfile::tempdir;
 
 fn send_request(stdin: &mut impl Write, req: &Value) {
     let body = serde_json::to_vec(req).expect("serialize req");
@@ -103,6 +108,88 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
     assert!(first_content.contains("order_id"));
 
     drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_uses_default_mapping_when_manual_not_provided() {
+    let dir = tempdir().expect("tmp");
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"src/main.py","content":"def run_order(order_id):\n    return order_id\n"}]
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    assert!(response.get("error").is_none(), "{response}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text payload");
+    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let obf_content = payload["obfuscated_files"][0]["content"]
+        .as_str()
+        .expect("content");
+    assert!(obf_content.contains("x_run"), "{payload}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_http_updates_default_mapping() {
+    let dir = tempdir().expect("tmp");
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, "{}").expect("init mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_HTTP_ADDR", "127.0.0.1:18787")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    thread::sleep(Duration::from_millis(200));
+
+    let mut stream = TcpStream::connect("127.0.0.1:18787").expect("connect http");
+    let body = r#"{"mapping":{"run_order":"x_run"}}"#;
+    let req = format!(
+        "PUT /mapping HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(req.as_bytes()).expect("write put");
+
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read put resp");
+    assert!(resp.contains("200"), "{resp}");
+
+    let saved = fs::read_to_string(&mapping_path).expect("saved mapping");
+    assert!(saved.contains("run_order"));
+
+    let _ = child.kill();
     let _ = child.wait();
 }
 

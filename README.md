@@ -112,6 +112,14 @@ make mcp-docker-run
 ./scripts/run-mcp-docker.sh
 ```
 
+Для включения HTTP API и дефолтного mapping в Docker-режиме:
+
+```bash
+MCP_HTTP_ADDR=127.0.0.1:18787 \
+MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
+./scripts/run-mcp-docker.sh
+```
+
 Также доступны отдельные шаги:
 
 ```bash
@@ -143,6 +151,33 @@ args = ["run", "--manifest-path", "/ABS/PATH/code-obfuscator/Cargo.toml", "--bin
 ```
 
 В такой конфигурации LLM (включая GPT-5.x в Codex CLI) будет вызывать инструменты `obfuscate_project`/`deobfuscate_project` через ваш локальный MCP-сервер.
+
+### Default mapping на стороне MCP + HTTP API
+
+Сервер поддерживает дефолтный mapping, который применяется в `obfuscate_project`, если `manual_mapping` не передан клиентом.
+
+Переменные окружения:
+
+- `MCP_DEFAULT_MAPPING_PATH` — путь к JSON-файлу дефолтного mapping (например `./mapping.default.json`).
+- `MCP_HTTP_ADDR` — адрес HTTP API для runtime-управления mapping (например `127.0.0.1:18787`).
+
+Пример запуска:
+
+```bash
+MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
+MCP_HTTP_ADDR=127.0.0.1:18787 \
+cargo run --bin mcp-server
+```
+
+HTTP endpoints:
+
+- `GET /health` — healthcheck.
+- `GET /mapping` — получить текущий default mapping.
+- `PUT /mapping` — обновить default mapping.
+  - body может быть либо JSON-object mapping (`{"a":"b"}`),
+  - либо envelope (`{"mapping": {"a":"b"}}`).
+
+После `PUT /mapping` состояние обновляется в памяти и сохраняется в `MCP_DEFAULT_MAPPING_PATH` (если путь задан).
 
 Ограничения текущей версии MCP:
 - только текстовые файлы (`path + content`),

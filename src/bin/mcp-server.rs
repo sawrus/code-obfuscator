@@ -559,10 +559,10 @@ fn to_file_entries(files: &[ProjectFile]) -> AppResult<Vec<FileEntry>> {
 }
 
 fn validate_mapping_payload(payload: &MappingPayload) -> AppResult<()> {
-    if let Some(exp) = payload.expires_at_epoch_s {
-        if now_epoch_s() > exp {
-            return Err(AppError::InvalidArg("mapping payload expired".into()));
-        }
+    if let Some(exp) = payload.expires_at_epoch_s
+        && now_epoch_s() > exp
+    {
+        return Err(AppError::InvalidArg("mapping payload expired".into()));
     }
 
     if let Some(sig) = &payload.signature {

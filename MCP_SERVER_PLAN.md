@@ -1,7 +1,7 @@
 # MCP server plan for code obfuscation pipeline (without `--deep`)
 
 ## Goal
-Build a stateless MCP server that:
+Build an MCP server with optional server-side default mapping that:
 1. receives a project tree (text files only),
 2. obfuscates it before handing to LLM,
 3. receives LLM output,
@@ -12,7 +12,7 @@ Current stage explicitly excludes deep mode (`--deep`).
 ## Confirmed requirements
 - MCP may work with full project trees (including projects cloned from Git).
 - Binary/non-text files are out of scope.
-- Server must be stateless: client always sends mapping back for deobfuscation.
+- Hybrid model: client may send mapping back for deobfuscation, but server may also use default mapping fallback.
 - Returning mapping in open/plain form is allowed.
 - Optional security extensions are desired: signature/TTL/encryption as opt-in.
 - Limits target: up to 1000 projects, each up to 1,000,000 files.
@@ -45,7 +45,7 @@ Behavior:
 ### Tool 2: `deobfuscate_project`
 Input:
 - `llm_output_files`: list of `{ path, content }`
-- `mapping_payload` (required)
+- `mapping_payload` (optional; if missing, server may use default mapping)
 - `options` (optional): `{ request_id }`
 
 Output:
@@ -100,7 +100,7 @@ Each event should include `request_id`, `stage`, `progress` (if measurable), and
 
 ## Security profile
 Baseline:
-- Stateless design.
+- Hybrid model with optional server-side default mapping.
 - Mapping returned to client in open form.
 
 Optional controls (feature flags):
@@ -112,7 +112,7 @@ Optional controls (feature flags):
 1. **Phase 1 (MVP)**
    - Two MCP tools (obfuscate/deobfuscate), non-streaming fallback,
    - text-only tree support,
-   - stateless plain mapping payload,
+   - default server mapping + plain mapping payload support,
    - metadata logs.
 2. **Phase 2**
    - streaming progress events,

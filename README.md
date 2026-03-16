@@ -86,7 +86,7 @@ make build
 В проекте добавлен отдельный MCP-серверный бинарник `mcp-server`, который реализует flow:
 
 1. `obfuscate_project` — обфускация дерева текстовых файлов перед отправкой в LLM (без `--deep`).
-2. `deobfuscate_project` — обратное восстановление результата LLM по `mapping_payload`.
+2. `deobfuscate_project` — обратное восстановление результата LLM по `mapping_payload` или по default mapping сервера (если payload не передан).
 
 Запуск:
 
@@ -179,11 +179,11 @@ HTTP endpoints:
 
 После `PUT /mapping` состояние обновляется в памяти и сохраняется в `MCP_DEFAULT_MAPPING_PATH` (если путь задан).
 
-Важно: default mapping на сервере используется только на шаге обфускации (когда `manual_mapping` не передан). Для деобфускации нужен `mapping_payload`, возвращённый из `obfuscate_project`, чтобы корректно восстановить именно тот вариант обфускации, который был отправлен в LLM.
+Важно: приоритет для деобфускации такой: (1) `mapping_payload` из запроса, (2) fallback на default mapping сервера. Рекомендуемый и наиболее точный путь — передавать `mapping_payload` из `obfuscate_project`, чтобы восстановить именно тот вариант обфускации, который ушёл в LLM.
 
 Ограничения текущей версии MCP:
 - только текстовые файлы (`path + content`),
-- гибридная модель: для `obfuscate_project` можно использовать server-side default mapping, но для `deobfuscate_project` клиент по-прежнему передаёт `mapping_payload` обратно,
+- гибридная модель: и `obfuscate_project`, и `deobfuscate_project` могут использовать server-side default mapping; если передан `mapping_payload`, он имеет приоритет,
 - fail-fast при деобфускации, если обязательные обфусцированные токены отсутствуют в ответе LLM,
 - `--deep` не используется.
 

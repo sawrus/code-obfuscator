@@ -194,6 +194,54 @@ fn mcp_http_updates_default_mapping() {
 }
 
 #[test]
+fn mcp_deobfuscate_uses_default_mapping_when_payload_missing() {
+    let dir = tempdir().expect("tmp");
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":11,
+            "method":"tools/call",
+            "params":{
+                "name":"deobfuscate_project",
+                "arguments":{
+                    "llm_output_files":[{"path":"a.py","content":"def x_run(order_id):
+    return order_id
+"}]
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    assert!(response.get("error").is_none(), "{response}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text payload");
+    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let restored = payload["restored_files"][0]["content"]
+        .as_str()
+        .expect("restored content");
+    assert!(restored.contains("run_order"), "{payload}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn mcp_deobfuscate_fails_fast_on_missing_tokens() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .stdin(Stdio::piped())

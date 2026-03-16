@@ -117,7 +117,7 @@ struct ObfuscateArgs {
 #[derive(Debug, Deserialize)]
 struct DeobfuscateArgs {
     llm_output_files: Vec<ProjectFile>,
-    mapping_payload: MappingPayload,
+    mapping_payload: Option<MappingPayload>,
     #[serde(default)]
     options: ToolOptions,
 }
@@ -346,7 +346,7 @@ fn handle_request(req: JsonRpcRequest, state: &AppState) -> AppResult<Value> {
 fn tools_definitions() -> Vec<Value> {
     vec![
         json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object"}}}}),
-        json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response using mapping payload.","inputSchema":{"type":"object","required":["llm_output_files","mapping_payload"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object"}}}}),
+        json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object"}}}}),
     ]
 }
 
@@ -359,7 +359,7 @@ fn call_tool(params: ToolCallParams, state: &AppState) -> AppResult<Value> {
         }
         "deobfuscate_project" => {
             let args: DeobfuscateArgs = serde_json::from_value(params.arguments)?;
-            let result = deobfuscate_project(args)?;
+            let result = deobfuscate_project(args, state)?;
             Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
         }
         _ => Err(AppError::InvalidArg("unknown tool".into())),
@@ -448,7 +448,7 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
     })
 }
 
-fn deobfuscate_project(args: DeobfuscateArgs) -> AppResult<DeobfuscateResult> {
+fn deobfuscate_project(args: DeobfuscateArgs, state: &AppState) -> AppResult<DeobfuscateResult> {
     validate_files(&args.llm_output_files)?;
     let request_id = args
         .options
@@ -457,14 +457,15 @@ fn deobfuscate_project(args: DeobfuscateArgs) -> AppResult<DeobfuscateResult> {
 
     let mut events = vec![];
     record_event(&mut events, "scanning");
-    validate_mapping_payload(&args.mapping_payload)?;
+
+    let mapping_payload = resolve_deobfuscation_mapping(args.mapping_payload, state)?;
+    validate_mapping_payload(&mapping_payload)?;
 
     let files = to_file_entries(&args.llm_output_files)?;
-    fail_fast_on_missing_tokens(&files, &args.mapping_payload.mapping.reverse)?;
+    fail_fast_on_missing_tokens(&files, &mapping_payload.mapping.reverse)?;
 
     record_event(&mut events, "deobfuscating");
-    let transformed =
-        obfuscator::transform_files_global(&files, &args.mapping_payload.mapping.reverse)?;
+    let transformed = obfuscator::transform_files_global(&files, &mapping_payload.mapping.reverse)?;
     let restored_files = transformed
         .into_iter()
         .map(|(rel, content)| ProjectFile {
@@ -479,9 +480,28 @@ fn deobfuscate_project(args: DeobfuscateArgs) -> AppResult<DeobfuscateResult> {
         restored_files,
         stats: Stats {
             file_count: files.len(),
-            mapping_entries: args.mapping_payload.mapping.reverse.len(),
+            mapping_entries: mapping_payload.mapping.reverse.len(),
         },
         events,
+    })
+}
+
+fn resolve_deobfuscation_mapping(
+    maybe_payload: Option<MappingPayload>,
+    state: &AppState,
+) -> AppResult<MappingPayload> {
+    if let Some(payload) = maybe_payload {
+        return Ok(payload);
+    }
+
+    let forward = state.default_mapping.get();
+    let reverse = invert(&forward)?;
+    Ok(MappingPayload {
+        mapping: MappingFile { forward, reverse },
+        created_at_epoch_s: now_epoch_s(),
+        expires_at_epoch_s: None,
+        signature: None,
+        encryption: None,
     })
 }
 

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 APP := code-obfuscator
 TARGETS := x86_64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin
 
-.PHONY: build fmt clippy test unit e2e svt coverage release-cross release-artifacts ci clean
+.PHONY: build fmt clippy test unit integration e2e svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
 
 build:
 	cargo build
@@ -14,10 +14,13 @@ fmt:
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
-test: unit e2e
+test: unit integration e2e
 
 unit:
 	cargo test --bins
+
+integration:
+	cargo test --test mcp_server
 
 e2e:
 	cargo test --test e2e
@@ -44,3 +47,10 @@ ci: fmt clippy test coverage
 
 clean:
 	cargo clean
+
+
+mcp-docker-build:
+	docker build -f docker/mcp.Dockerfile -t code-obfuscator-mcp:local .
+
+mcp-docker-run: mcp-docker-build
+	docker run --rm -i code-obfuscator-mcp:local

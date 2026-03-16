@@ -80,10 +80,117 @@ make build
 
 Если заданы `--ollama-url` и `--ollama-model`, утилита отправляет часть language-aware обнаруженных терминов в Ollama и добавляет валидные ответы в карту замен.
 
+
+## MCP server (stdio)
+
+В проекте добавлен отдельный MCP-серверный бинарник `mcp-server`, который реализует flow:
+
+1. `obfuscate_project` — обфускация дерева текстовых файлов перед отправкой в LLM (без `--deep`).
+2. `deobfuscate_project` — обратное восстановление результата LLM по `mapping_payload` или по default mapping сервера (если payload не передан).
+
+Запуск:
+
+```bash
+cargo run --bin mcp-server
+```
+
+Сервер работает по MCP/JSON-RPC через `stdio` (`Content-Length` framing) и экспортирует tools:
+- `obfuscate_project`
+- `deobfuscate_project`
+
+### Запуск MCP через Docker
+
+Сборка и запуск из Docker:
+
+```bash
+make mcp-docker-run
+```
+
+Или напрямую:
+
+```bash
+./scripts/run-mcp-docker.sh
+```
+
+Для включения HTTP API и дефолтного mapping в Docker-режиме:
+
+```bash
+MCP_HTTP_ADDR=127.0.0.1:18787 \
+MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
+./scripts/run-mcp-docker.sh
+```
+
+Также доступны отдельные шаги:
+
+```bash
+make mcp-docker-build
+docker run --rm -i code-obfuscator-mcp:local
+```
+
+### Подключение локального MCP в Codex CLI
+
+Добавьте сервер в конфиг Codex CLI (пример `~/.codex/config.toml`):
+
+```toml
+[mcp_servers.code_obfuscator]
+command = "docker"
+args = [
+  "run", "--rm", "-i",
+  "code-obfuscator-mcp:local"
+]
+```
+
+После этого перезапустите Codex CLI и проверьте, что сервер доступен в списке MCP-серверов.
+
+Если хотите запускать без Docker, можно указать бинарник напрямую:
+
+```toml
+[mcp_servers.code_obfuscator]
+command = "cargo"
+args = ["run", "--manifest-path", "/ABS/PATH/code-obfuscator/Cargo.toml", "--bin", "mcp-server"]
+```
+
+В такой конфигурации LLM (включая GPT-5.x в Codex CLI) будет вызывать инструменты `obfuscate_project`/`deobfuscate_project` через ваш локальный MCP-сервер.
+
+### Default mapping на стороне MCP + HTTP API
+
+Сервер поддерживает дефолтный mapping, который применяется в `obfuscate_project`, если `manual_mapping` не передан клиентом.
+
+Переменные окружения:
+
+- `MCP_DEFAULT_MAPPING_PATH` — путь к JSON-файлу дефолтного mapping (например `./mapping.default.json`).
+- `MCP_HTTP_ADDR` — адрес HTTP API для runtime-управления mapping (например `127.0.0.1:18787`).
+
+Пример запуска:
+
+```bash
+MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
+MCP_HTTP_ADDR=127.0.0.1:18787 \
+cargo run --bin mcp-server
+```
+
+HTTP endpoints:
+
+- `GET /health` — healthcheck.
+- `GET /mapping` — получить текущий default mapping.
+- `PUT /mapping` — обновить default mapping.
+  - body может быть либо JSON-object mapping (`{"a":"b"}`),
+  - либо envelope (`{"mapping": {"a":"b"}}`).
+
+После `PUT /mapping` состояние обновляется в памяти и сохраняется в `MCP_DEFAULT_MAPPING_PATH` (если путь задан).
+
+Важно: приоритет для деобфускации такой: (1) `mapping_payload` из запроса, (2) fallback на default mapping сервера. Рекомендуемый и наиболее точный путь — передавать `mapping_payload` из `obfuscate_project`, чтобы восстановить именно тот вариант обфускации, который ушёл в LLM.
+
+Ограничения текущей версии MCP:
+- только текстовые файлы (`path + content`),
+- гибридная модель: и `obfuscate_project`, и `deobfuscate_project` могут использовать server-side default mapping; если передан `mapping_payload`, он имеет приоритет,
+- fail-fast при деобфускации, если обязательные обфусцированные токены отсутствуют в ответе LLM,
+- `--deep` не используется.
+
 ## Makefile команды
 
 - `make build` - сборка.
-- `make test` - unit + e2e.
+- `make test` - unit + integration (`tests/mcp_server.rs`) + e2e.
 - `make e2e` - только e2e.
 - `make svt` - нагрузочный blackbox тест (`ignored` по умолчанию, запуск вручную).
 - `make coverage` - отчёт покрытия через `cargo llvm-cov`.

@@ -190,7 +190,7 @@ HTTP endpoints:
 ## Makefile команды
 
 - `make build` - сборка.
-- `make test` - unit + e2e.
+- `make test` - unit + integration (`tests/mcp_server.rs`) + e2e.
 - `make e2e` - только e2e.
 - `make svt` - нагрузочный blackbox тест (`ignored` по умолчанию, запуск вручную).
 - `make coverage` - отчёт покрытия через `cargo llvm-cov`.

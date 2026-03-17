@@ -8,6 +8,8 @@ mod fs_ops;
 mod language;
 #[path = "../mapping.rs"]
 mod mapping;
+#[path = "../mcp_logging.rs"]
+mod mcp_logging;
 #[path = "../obfuscator.rs"]
 mod obfuscator;
 
@@ -20,11 +22,12 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use error::{AppError, AppResult};
 use fs_ops::FileEntry;
 use mapping::{MappingFile, detect_terms, enrich_with_random, invert};
+use mcp_logging::{LogEvent, McpLogger};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -33,6 +36,7 @@ const MAX_FILES_PER_PROJECT: usize = 1_000_000;
 #[derive(Clone)]
 struct AppState {
     default_mapping: MappingStore,
+    logger: McpLogger,
 }
 
 #[derive(Clone)]
@@ -74,7 +78,7 @@ impl MappingStore {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
     id: Option<Value>,
     method: String,
@@ -126,6 +130,7 @@ struct DeobfuscateArgs {
 struct ToolOptions {
     request_id: Option<String>,
     stream: Option<bool>,
+    enrich_detected_terms: Option<bool>,
     security: Option<SecurityOptions>,
 }
 
@@ -182,12 +187,39 @@ fn main() {
 }
 
 fn run() -> AppResult<()> {
+    let logger = McpLogger::from_env()?;
     let mapping_path = env::var("MCP_DEFAULT_MAPPING_PATH").ok().map(PathBuf::from);
     let state = AppState {
         default_mapping: MappingStore::new(mapping_path),
+        logger,
     };
 
+    state.logger.log(LogEvent {
+        level: "info",
+        transport: "stdio",
+        direction: "lifecycle",
+        request_id: None,
+        jsonrpc_id: None,
+        method: None,
+        path: None,
+        status: Some("ready"),
+        duration_ms: None,
+        payload: None,
+    });
+
     if let Ok(addr) = env::var("MCP_HTTP_ADDR") {
+        state.logger.log(LogEvent {
+            level: "info",
+            transport: "http",
+            direction: "lifecycle",
+            request_id: None,
+            jsonrpc_id: None,
+            method: None,
+            path: Some("/"),
+            status: Some("listening"),
+            duration_ms: None,
+            payload: Some(&json!({ "addr": addr })),
+        });
         let state_for_http = state.clone();
         thread::spawn(move || {
             if let Err(err) = run_http_api(&addr, state_for_http) {
@@ -206,11 +238,46 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
     let mut out = stdout.lock();
 
     while let Some(req) = read_message(&mut reader)? {
-        let id = req.id.clone().unwrap_or(Value::Null);
-        if req.id.is_none() {
+        let started = Instant::now();
+        let request_payload = serde_json::to_value(&req).ok();
+        let request_id = extract_request_id(&req);
+        let method = req.method.clone();
+        let id_opt = req.id.clone();
+
+        state.logger.log(LogEvent {
+            level: "info",
+            transport: "stdio",
+            direction: "request",
+            request_id: request_id.as_deref(),
+            jsonrpc_id: id_opt.as_ref(),
+            method: Some(&method),
+            path: None,
+            status: Some("received"),
+            duration_ms: None,
+            payload: request_payload.as_ref(),
+        });
+
+        if id_opt.is_none() {
+            let status = match handle_request(req, &state) {
+                Ok(_) => "notification_ok",
+                Err(_) => "notification_error",
+            };
+            state.logger.log(LogEvent {
+                level: "info",
+                transport: "stdio",
+                direction: "response",
+                request_id: request_id.as_deref(),
+                jsonrpc_id: None,
+                method: Some(&method),
+                path: None,
+                status: Some(status),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: None,
+            });
             continue;
         }
 
+        let id = id_opt.unwrap_or(Value::Null);
         let response = match handle_request(req, &state) {
             Ok(result) => JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -226,6 +293,25 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
             },
         };
 
+        let response_payload = serde_json::to_value(&response).ok();
+        let status = if response.error.is_some() {
+            "error"
+        } else {
+            "ok"
+        };
+        state.logger.log(LogEvent {
+            level: "info",
+            transport: "stdio",
+            direction: "response",
+            request_id: request_id.as_deref(),
+            jsonrpc_id: Some(&response.id),
+            method: Some(&method),
+            path: None,
+            status: Some(status),
+            duration_ms: Some(started.elapsed().as_millis()),
+            payload: response_payload.as_ref(),
+        });
+
         write_message(&mut out, &response)?;
     }
 
@@ -236,6 +322,18 @@ fn run_http_api(addr: &str, state: AppState) -> AppResult<()> {
     let listener = TcpListener::bind(addr)?;
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else {
+            state.logger.log(LogEvent {
+                level: "warn",
+                transport: "http",
+                direction: "request",
+                request_id: None,
+                jsonrpc_id: None,
+                method: None,
+                path: None,
+                status: Some("accept_failed"),
+                duration_ms: None,
+                payload: None,
+            });
             continue;
         };
         let _ = handle_http_connection(&mut stream, &state);
@@ -244,6 +342,7 @@ fn run_http_api(addr: &str, state: AppState) -> AppResult<()> {
 }
 
 fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult<()> {
+    let started = Instant::now();
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first = String::new();
     if reader.read_line(&mut first)? == 0 {
@@ -251,7 +350,20 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     }
     let parts: Vec<&str> = first.split_whitespace().collect();
     if parts.len() < 2 {
-        return write_http(stream, 400, json!({"error":"bad request"}));
+        write_http_json(stream, 400, &json!({"error":"bad request"}))?;
+        state.logger.log(LogEvent {
+            level: "warn",
+            transport: "http-admin",
+            direction: "response",
+            request_id: None,
+            jsonrpc_id: None,
+            method: None,
+            path: None,
+            status: Some("bad_request"),
+            duration_ms: Some(started.elapsed().as_millis()),
+            payload: Some(&json!({"error":"bad request"})),
+        });
+        return Ok(());
     }
     let method = parts[0];
     let path = parts[1];
@@ -267,7 +379,11 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
         if t.is_empty() {
             break;
         }
-        if let Some(v) = t.strip_prefix("Content-Length:") {
+        if let Some(v) = t
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::to_string)
+        {
             content_length = v.trim().parse::<usize>().unwrap_or(0);
         }
     }
@@ -276,40 +392,253 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
+    let body_text = String::from_utf8(body).unwrap_or_default();
+    let body_json = serde_json::from_str::<Value>(&body_text).ok();
+    let transport = if path == "/" || path == "/mcp" {
+        "http-mcp"
+    } else {
+        "http-admin"
+    };
+    let fallback_payload = if body_text.is_empty() {
+        None
+    } else {
+        Some(json!({"raw": body_text.clone()}))
+    };
+    let request_payload_ref = body_json.as_ref().or(fallback_payload.as_ref());
+
+    state.logger.log(LogEvent {
+        level: "info",
+        transport,
+        direction: "request",
+        request_id: body_json
+            .as_ref()
+            .and_then(extract_request_id_from_value)
+            .as_deref(),
+        jsonrpc_id: body_json.as_ref().and_then(|v| v.get("id")),
+        method: body_json
+            .as_ref()
+            .and_then(|v| v.get("method"))
+            .and_then(Value::as_str)
+            .or(Some(method)),
+        path: Some(path),
+        status: Some("received"),
+        duration_ms: None,
+        payload: request_payload_ref,
+    });
 
     match (method, path) {
-        ("GET", "/health") => write_http(stream, 200, json!({"ok":true})),
+        ("GET", "/health") => {
+            let response = json!({"ok":true});
+            write_http_json(stream, 200, &response)?;
+            state.logger.log(LogEvent {
+                level: "info",
+                transport,
+                direction: "response",
+                request_id: None,
+                jsonrpc_id: None,
+                method: Some(method),
+                path: Some(path),
+                status: Some("ok"),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: Some(&response),
+            });
+            Ok(())
+        }
         ("GET", "/mapping") => {
-            write_http(stream, 200, json!({"mapping": state.default_mapping.get()}))
+            let response = json!({"mapping": state.default_mapping.get()});
+            write_http_json(stream, 200, &response)?;
+            state.logger.log(LogEvent {
+                level: "info",
+                transport,
+                direction: "response",
+                request_id: None,
+                jsonrpc_id: None,
+                method: Some(method),
+                path: Some(path),
+                status: Some("ok"),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: Some(&response),
+            });
+            Ok(())
         }
         ("PUT", "/mapping") => {
-            let body_text = String::from_utf8(body).unwrap_or_default();
             match parse_mapping_update(&body_text).and_then(|m| {
                 state.default_mapping.set(m.clone())?;
                 Ok(m)
             }) {
-                Ok(map) => write_http(stream, 200, json!({"mapping":map})),
-                Err(err) => write_http(stream, 400, json!({"error":err.to_string()})),
+                Ok(map) => {
+                    let response = json!({"mapping":map});
+                    write_http_json(stream, 200, &response)?;
+                    state.logger.log(LogEvent {
+                        level: "info",
+                        transport,
+                        direction: "response",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: Some(method),
+                        path: Some(path),
+                        status: Some("ok"),
+                        duration_ms: Some(started.elapsed().as_millis()),
+                        payload: Some(&response),
+                    });
+                    Ok(())
+                }
+                Err(err) => {
+                    let response = json!({"error":err.to_string()});
+                    write_http_json(stream, 400, &response)?;
+                    state.logger.log(LogEvent {
+                        level: "warn",
+                        transport,
+                        direction: "response",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: Some(method),
+                        path: Some(path),
+                        status: Some("error"),
+                        duration_ms: Some(started.elapsed().as_millis()),
+                        payload: Some(&response),
+                    });
+                    Ok(())
+                }
             }
         }
-        _ => write_http(stream, 404, json!({"error":"not found"})),
+        ("POST", "/") | ("POST", "/mcp") => {
+            let req = serde_json::from_str::<JsonRpcRequest>(&body_text)
+                .map_err(|_| AppError::InvalidArg("invalid JSON-RPC request".into()));
+
+            let req = match req {
+                Ok(req) => req,
+                Err(err) => {
+                    let response = json!({"error": err.to_string()});
+                    write_http_json(stream, 400, &response)?;
+                    state.logger.log(LogEvent {
+                        level: "warn",
+                        transport,
+                        direction: "response",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: Some(method),
+                        path: Some(path),
+                        status: Some("bad_request"),
+                        duration_ms: Some(started.elapsed().as_millis()),
+                        payload: Some(&response),
+                    });
+                    return Ok(());
+                }
+            };
+
+            let request_id = extract_request_id(&req);
+            let request_method = req.method.clone();
+            let jsonrpc_id = req.id.clone();
+
+            if jsonrpc_id.is_none() {
+                let status = match handle_request(req, state) {
+                    Ok(_) => "notification_ok",
+                    Err(_) => "notification_error",
+                };
+                write_http_no_content(stream, 204)?;
+                state.logger.log(LogEvent {
+                    level: "info",
+                    transport,
+                    direction: "response",
+                    request_id: request_id.as_deref(),
+                    jsonrpc_id: None,
+                    method: Some(&request_method),
+                    path: Some(path),
+                    status: Some(status),
+                    duration_ms: Some(started.elapsed().as_millis()),
+                    payload: None,
+                });
+                return Ok(());
+            }
+
+            let id = jsonrpc_id.unwrap_or(Value::Null);
+            let response = match handle_request(req, state) {
+                Ok(result) => JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(result),
+                    error: None,
+                },
+                Err(err) => JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({"code": -32000, "message": err.to_string()})),
+                },
+            };
+
+            let response_payload = serde_json::to_value(&response)?;
+            write_http_json(stream, 200, &response_payload)?;
+            let status = if response.error.is_some() {
+                "error"
+            } else {
+                "ok"
+            };
+            state.logger.log(LogEvent {
+                level: "info",
+                transport,
+                direction: "response",
+                request_id: request_id.as_deref(),
+                jsonrpc_id: Some(&response.id),
+                method: Some(&request_method),
+                path: Some(path),
+                status: Some(status),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: Some(&response_payload),
+            });
+            Ok(())
+        }
+        _ => {
+            let response = json!({"error":"not found"});
+            write_http_json(stream, 404, &response)?;
+            state.logger.log(LogEvent {
+                level: "warn",
+                transport,
+                direction: "response",
+                request_id: None,
+                jsonrpc_id: None,
+                method: Some(method),
+                path: Some(path),
+                status: Some("not_found"),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: Some(&response),
+            });
+            Ok(())
+        }
     }
 }
 
-fn write_http(stream: &mut TcpStream, status: u16, body: Value) -> AppResult<()> {
-    let json = serde_json::to_vec(&body)?;
+fn write_http_json(stream: &mut TcpStream, status: u16, body: &Value) -> AppResult<()> {
+    let json = serde_json::to_vec(body)?;
+    write_http_bytes(stream, status, "application/json", &json)
+}
+
+fn write_http_no_content(stream: &mut TcpStream, status: u16) -> AppResult<()> {
+    write_http_bytes(stream, status, "application/json", &[])
+}
+
+fn write_http_bytes(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> AppResult<()> {
     let status_text = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         _ => "Error",
     };
     let header = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        json.len()
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(&json)?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
     stream.flush()?;
     Ok(())
 }
@@ -325,6 +654,42 @@ fn parse_mapping_update(body: &str) -> AppResult<BTreeMap<String, String>> {
     Err(AppError::InvalidArg(
         "expected JSON object or {\"mapping\":{...}}".into(),
     ))
+}
+
+fn extract_request_id(req: &JsonRpcRequest) -> Option<String> {
+    if req.method == "tools/call"
+        && let Some(req_id) = req
+            .params
+            .get("arguments")
+            .and_then(|v| v.get("options"))
+            .and_then(|v| v.get("request_id"))
+            .and_then(Value::as_str)
+    {
+        return Some(req_id.to_string());
+    }
+    req.id.as_ref().map(json_value_to_string)
+}
+
+fn extract_request_id_from_value(v: &Value) -> Option<String> {
+    if v.get("method").and_then(Value::as_str) == Some("tools/call")
+        && let Some(req_id) = v
+            .get("params")
+            .and_then(|p| p.get("arguments"))
+            .and_then(|a| a.get("options"))
+            .and_then(|o| o.get("request_id"))
+            .and_then(Value::as_str)
+    {
+        return Some(req_id.to_string());
+    }
+    v.get("id").map(json_value_to_string)
+}
+
+fn json_value_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        _ => v.to_string(),
+    }
 }
 
 fn handle_request(req: JsonRpcRequest, state: &AppState) -> AppResult<Value> {
@@ -345,8 +710,8 @@ fn handle_request(req: JsonRpcRequest, state: &AppState) -> AppResult<Value> {
 
 fn tools_definitions() -> Vec<Value> {
     vec![
-        json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object"}}}}),
-        json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object"}}}}),
+        json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
+        json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
     ]
 }
 
@@ -382,8 +747,10 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
     } else {
         args.manual_mapping
     };
-    let terms = detect_terms(&files)?;
-    enrich_with_random(&mut forward_map, &terms, &files, None);
+    if args.options.enrich_detected_terms.unwrap_or(false) {
+        let terms = detect_terms(&files)?;
+        enrich_with_random(&mut forward_map, &terms, &files, None);
+    }
 
     record_event(&mut events, "obfuscating");
     let transformed = obfuscator::transform_files_global(&files, &forward_map)?;
@@ -626,8 +993,10 @@ fn read_message<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>>
         if trimmed.is_empty() {
             break;
         }
-        if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-            let parsed = v
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            let parsed = value
                 .trim()
                 .parse::<usize>()
                 .map_err(|_| AppError::InvalidArg("invalid Content-Length".into()))?;

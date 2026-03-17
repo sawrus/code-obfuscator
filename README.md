@@ -65,12 +65,14 @@ command = "docker"
 args = [
   "run", "--rm", "-i",
   "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
-  "-v", "./mapping.default.json:/data/mapping.default.json",
+  "-e", "MCP_LOG_STDOUT=false",
+  "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json",
   "code-obfuscator-mcp:local"
 ]
 ```
 
 В stdio-режиме mapping читается из пути `MCP_DEFAULT_MAPPING_PATH` внутри контейнера (`/data/mapping.default.json`), который смонтирован с хоста.
+Сервер поддерживает оба формата stdio framing: `Content-Length` и JSON-lines.
 
 ## Шаг 4. Проверить, что MCP доступен
 
@@ -162,11 +164,16 @@ cargo run --bin mcp-server
 - Проверьте `GET /health`.
 - Убедитесь, что используете MCP endpoint `POST /` или `POST /mcp`.
 
-2. В результате нет замен из `mapping.default.json`.
+2. `stdio + docker` даёт `timed out handshaking after 10s`.
+- Частая причина: Codex-процесс не имеет доступа к Docker socket.
+- Проверка: `docker run --rm -i ... code-obfuscator-mcp:local` в том же окружении.
+- Если доступ к Docker ограничен, используйте `url = "http://127.0.0.1:18787"` и запускайте MCP отдельно (например, `./scripts/run-mcp-docker.sh`).
+
+3. В результате нет замен из `mapping.default.json`.
 - Проверьте, что `MCP_DEFAULT_MAPPING_PATH` указывает на существующий файл.
 - В stdio+docker проверьте корректный `-v` mount.
 
-3. Результат “слишком сильно” обфусцирован.
+4. Результат “слишком сильно” обфусцирован.
 - Убедитесь, что `options.enrich_detected_terms` не включен.
 
 ## Полезные команды разработки

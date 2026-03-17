@@ -18,12 +18,32 @@ fn send_request(stdin: &mut impl Write, req: &Value) {
     stdin.flush().expect("flush");
 }
 
+fn send_request_json_line(stdin: &mut impl Write, req: &Value) {
+    let body = serde_json::to_string(req).expect("serialize req");
+    stdin.write_all(body.as_bytes()).expect("write body");
+    stdin.write_all(b"\n").expect("write newline");
+    stdin.flush().expect("flush");
+}
+
 fn send_request_lowercase_header(stdin: &mut impl Write, req: &Value) {
     let body = serde_json::to_vec(req).expect("serialize req");
     let header = format!("content-length: {}\r\n\r\n", body.len());
     stdin.write_all(header.as_bytes()).expect("write header");
     stdin.write_all(&body).expect("write body");
     stdin.flush().expect("flush");
+}
+
+fn read_response_json_line(stdout: &mut impl Read) -> Value {
+    let mut line = Vec::new();
+    let mut buf = [0_u8; 1];
+    loop {
+        stdout.read_exact(&mut buf).expect("read byte");
+        if buf[0] == b'\n' {
+            break;
+        }
+        line.push(buf[0]);
+    }
+    serde_json::from_slice(&line).expect("parse response")
 }
 
 fn read_response(stdout: &mut impl Read) -> Value {
@@ -235,6 +255,38 @@ fn mcp_stdio_accepts_lowercase_content_length_header() {
         }),
     );
     let response = read_response(&mut stdout);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"].as_str(),
+        Some("code-obfuscator-mcp")
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_stdio_accepts_json_line_protocol() {
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request_json_line(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":902,
+            "method":"initialize",
+            "params":{}
+        }),
+    );
+    let response = read_response_json_line(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(
         response["result"]["serverInfo"]["name"].as_str(),

@@ -86,6 +86,12 @@ struct JsonRpcRequest {
     params: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdioFraming {
+    ContentLength,
+    JsonLine,
+}
+
 #[derive(Debug, Serialize)]
 struct JsonRpcResponse {
     jsonrpc: &'static str,
@@ -236,8 +242,12 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut out = stdout.lock();
+    let mut framing: Option<StdioFraming> = None;
 
-    while let Some(req) = read_message(&mut reader)? {
+    while let Some((req, detected_framing)) = read_message(&mut reader, framing)? {
+        if framing.is_none() {
+            framing = Some(detected_framing);
+        }
         let started = Instant::now();
         let request_payload = serde_json::to_value(&req).ok();
         let request_id = extract_request_id(&req);
@@ -312,7 +322,11 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
             payload: response_payload.as_ref(),
         });
 
-        write_message(&mut out, &response)?;
+        write_message(
+            &mut out,
+            &response,
+            framing.unwrap_or(StdioFraming::ContentLength),
+        )?;
     }
 
     Ok(())
@@ -980,9 +994,66 @@ fn now_epoch_s() -> u64 {
         .unwrap_or(0)
 }
 
-fn read_message<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
-    let mut content_len: Option<usize> = None;
+fn read_message<R: BufRead>(
+    reader: &mut R,
+    framing: Option<StdioFraming>,
+) -> AppResult<Option<(JsonRpcRequest, StdioFraming)>> {
+    match framing {
+        Some(StdioFraming::ContentLength) => read_message_content_length(reader)
+            .map(|opt| opt.map(|req| (req, StdioFraming::ContentLength))),
+        Some(StdioFraming::JsonLine) => {
+            read_message_json_line(reader).map(|opt| opt.map(|req| (req, StdioFraming::JsonLine)))
+        }
+        None => read_message_auto(reader),
+    }
+}
 
+fn read_message_auto<R: BufRead>(
+    reader: &mut R,
+) -> AppResult<Option<(JsonRpcRequest, StdioFraming)>> {
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('{') {
+            let req: JsonRpcRequest = serde_json::from_str(trimmed)?;
+            return Ok(Some((req, StdioFraming::JsonLine)));
+        }
+
+        let mut content_len = parse_content_length_header(trimmed)?;
+        loop {
+            let mut next_line = String::new();
+            let n = reader.read_line(&mut next_line)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let trimmed_next = next_line.trim_end();
+            if trimmed_next.is_empty() {
+                break;
+            }
+            if let Some(parsed) = parse_content_length_header(trimmed_next)? {
+                content_len = Some(parsed);
+            }
+        }
+
+        let len =
+            content_len.ok_or_else(|| AppError::InvalidArg("missing Content-Length".into()))?;
+        let mut body = vec![0_u8; len];
+        reader.read_exact(&mut body)?;
+        let req: JsonRpcRequest = serde_json::from_slice(&body)?;
+        return Ok(Some((req, StdioFraming::ContentLength)));
+    }
+}
+
+fn read_message_content_length<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
+    let mut content_len: Option<usize> = None;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -993,13 +1064,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>>
         if trimmed.is_empty() {
             break;
         }
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| AppError::InvalidArg("invalid Content-Length".into()))?;
+        if let Some(parsed) = parse_content_length_header(trimmed)? {
             content_len = Some(parsed);
         }
     }
@@ -1011,11 +1076,52 @@ fn read_message<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>>
     Ok(Some(req))
 }
 
-fn write_message<W: Write>(writer: &mut W, message: &JsonRpcResponse) -> AppResult<()> {
+fn read_message_json_line<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let req: JsonRpcRequest = serde_json::from_str(trimmed)?;
+        return Ok(Some(req));
+    }
+}
+
+fn parse_content_length_header(line: &str) -> AppResult<Option<usize>> {
+    if let Some((name, value)) = line.split_once(':')
+        && name.trim().eq_ignore_ascii_case("content-length")
+    {
+        let parsed = value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| AppError::InvalidArg("invalid Content-Length".into()))?;
+        return Ok(Some(parsed));
+    }
+    Ok(None)
+}
+
+fn write_message<W: Write>(
+    writer: &mut W,
+    message: &JsonRpcResponse,
+    framing: StdioFraming,
+) -> AppResult<()> {
     let body = serde_json::to_vec(message)?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    writer.write_all(header.as_bytes())?;
-    writer.write_all(&body)?;
+    match framing {
+        StdioFraming::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            writer.write_all(header.as_bytes())?;
+            writer.write_all(&body)?;
+        }
+        StdioFraming::JsonLine => {
+            writer.write_all(&body)?;
+            writer.write_all(b"\n")?;
+        }
+    }
     writer.flush()?;
     Ok(())
 }

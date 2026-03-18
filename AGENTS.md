@@ -41,6 +41,32 @@ project_dir/
 
 Prefer relative paths in references inside markdown files.
 
+## Slash Command Routing
+
+Treat a user message that starts with a slash command as an explicit workflow invocation, not as a generic natural-language request.
+
+### Dispatch contract
+
+- If the first non-empty line starts with `/command-name`, first look for an exact `trigger: /command-name` match in `project_dir/.agent/workflows/*.md`.
+- If an exact workflow match exists, load and apply that workflow before planning or implementing anything.
+- Also load the matching helper prompt from `project_dir/.agent/prompts/command-name.md` when present to infer the expected input shape and examples.
+- Do not ask whether the workflow should be used when the trigger matches exactly; assume the slash command is intentional.
+- If several files match, prefer the workflow whose `name:` matches the command name exactly; otherwise ask for clarification.
+- If no exact workflow match exists, fall back to the closest matching prompt in `.agent/prompts/*`; if still no match, handle the request normally.
+
+### Input parsing for slash commands
+
+- Treat the quoted text immediately after the slash command as the task title or feature name when present.
+- Treat the remaining lines as structured task context.
+- Preserve section labels in either English or Russian, including `Feature:`, `Фича:`, `Acceptance criteria:`, `Критерии приёмки:`, `Constraints:`, and `Ограничения:`.
+- Pass the parsed body into the workflow inputs without requiring the user to restate it in another format.
+
+### Examples
+
+- `/develop-feature "Some feature"` => load `.agent/workflows/develop-feature.md` and `.agent/prompts/develop-feature.md`
+- `/debug-issue "Some bug"` => load `.agent/workflows/debug-issue.md` and `.agent/prompts/debug-issue.md`
+- `/dev PROJ-123 "Some task"` => load `.agent/workflows/development-cycle-workflow.md` and `.agent/prompts/dev.md`
+
 ## General Development Practices
 
 This section covers foundational software development practices applicable to any project.
@@ -175,4 +201,3 @@ general/
 - `workflows/*.md`
 
 ---
-

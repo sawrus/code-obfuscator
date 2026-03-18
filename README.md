@@ -1,118 +1,37 @@
 # code-obfuscator
 
-CLI-утилита для обфускации исходного кода перед отправкой в AI-агента и обратной деобфускации после обработки.
+MCP-сервер и CLI для безопасной обфускации кода перед LLM и обратного применения изменений в проект.
 
-## Возможности
+## Актуальная модель MCP
 
-- Режим `forward`: обфускация из исходной директории в целевую.
-- Режим `reverse`: восстановление исходных терминов из обфусцированного кода.
-- Language-aware распознавание 10 языков: Python, JavaScript, TypeScript, Java, C#, C/C++, Go, Rust, SQL, Bash.
-- Поддержка PostgreSQL SQL-лексики с совместимостью с ANSI/MySQL ключевыми словами.
-- Флаг `--deep` включает language-aware обфускацию (SQL/Python и др.).
-- По умолчанию выполняется только глобальная whole-word замена по `--mapping` во всех файлах проекта.
-- Защита Python-импортов и builtins: внешние классы/символы не переименовываются.
-- Обфускация идентификаторов в коде, строках и комментариях (по whole-word замене).
-- Опциональный `mapping.json` с ручными правилами (`Freeze -> Go`, `Antifraud -> Apple`).
-- Опциональная интеграция с Ollama API для предложения дополнительных замен (best-effort).
-- Генерация `mapping.generated.json` для обратного преобразования.
-- Кроссплатформенная сборка бинарника (macOS/Linux/Windows).
+По умолчанию сервер экспортирует инструменты:
+- `list_project_tree`
+- `obfuscate_project_from_paths`
+- `obfuscate_project`
+- `apply_llm_output`
+
+Прямые инструменты деобфускации (`deobfuscate_project`, `deobfuscate_project_from_paths`) по умолчанию отключены и скрыты из `tools/list`.
+Для legacy-совместимости включаются через `MCP_ALLOW_DIRECT_DEOBFUSCATION=true`.
 
 ## Быстрый старт
 
-```bash
-make build
-```
-
-### Обфускация
-
-```bash
-./target/debug/code-obfuscator \
-  --mode forward \
-  --source ./project-src \
-  --target ./project-obf \
-  --mapping ./mapping.json
-```
-
-> По умолчанию (без `--deep`) используется только глобальная замена по `mapping.json`.
-
-
-### Глубокая language-aware обфускация
-
-```bash
-./target/debug/code-obfuscator \
-  --mode forward \
-  --source ./project-src \
-  --target ./project-obf \
-  --mapping ./mapping.json \
-  --deep
-```
-
-### Деобфускация
-
-```bash
-./target/debug/code-obfuscator \
-  --mode reverse \
-  --source ./project-obf \
-  --target ./project-restored \
-  --mapping ./project-obf/mapping.generated.json
-```
-
-## Формат mapping.json
+1. Подготовьте mapping (опционально, но рекомендуется):
 
 ```json
 {
-  "Freeze": "Go",
-  "Antifraud": "Apple"
+  "business_secret": "bs"
 }
 ```
 
-## Ollama (опционально)
+2. Соберите сервер:
 
 ```bash
-./target/debug/code-obfuscator \
-  --mode forward \
-  --source ./project-src \
-  --target ./project-obf \
-  --ollama-url http://localhost:11434 \
-  --ollama-model llama3.1 \
-  --ollama-top-n 40
+cargo build --bin mcp-server
+# или
+make mcp-docker-build
 ```
 
-Если заданы `--ollama-url` и `--ollama-model`, утилита отправляет часть language-aware обнаруженных терминов в Ollama и добавляет валидные ответы в карту замен.
-
-
-## MCP server (stdio)
-
-В проекте добавлен отдельный MCP-серверный бинарник `mcp-server`, который реализует flow:
-
-1. `obfuscate_project` — обфускация дерева текстовых файлов перед отправкой в LLM (без `--deep`).
-2. `deobfuscate_project` — обратное восстановление результата LLM по `mapping_payload` или по default mapping сервера (если payload не передан).
-
-Запуск:
-
-```bash
-cargo run --bin mcp-server
-```
-
-Сервер работает по MCP/JSON-RPC через `stdio` (`Content-Length` framing) и экспортирует tools:
-- `obfuscate_project`
-- `deobfuscate_project`
-
-### Запуск MCP через Docker
-
-Сборка и запуск из Docker:
-
-```bash
-make mcp-docker-run
-```
-
-Или напрямую:
-
-```bash
-./scripts/run-mcp-docker.sh
-```
-
-Для включения HTTP API и дефолтного mapping в Docker-режиме:
+3. Запустите MCP по HTTP:
 
 ```bash
 MCP_HTTP_ADDR=127.0.0.1:18787 \
@@ -120,121 +39,92 @@ MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
 ./scripts/run-mcp-docker.sh
 ```
 
-Также доступны отдельные шаги:
+4. Проверьте:
 
 ```bash
-make mcp-docker-build
-docker run --rm -i code-obfuscator-mcp:local
+curl -i http://127.0.0.1:18787/health
+curl -i http://127.0.0.1:18787/mapping
 ```
 
-### Подключение локального MCP в Codex CLI
+## Подключение в Codex
 
-Добавьте сервер в конфиг Codex CLI (пример `~/.codex/config.toml`):
+### Вариант 1: HTTP
 
 ```toml
 [mcp_servers.code_obfuscator]
+enabled = true
+url = "http://127.0.0.1:18787"
+```
+
+### Вариант 2: stdio + docker
+
+Важно: если используете `apply_llm_output`, проект должен быть смонтирован как `:rw`.
+Для path-based инструментов (`list_project_tree`, `obfuscate_project_from_paths`, `apply_llm_output`) `root_dir` должен быть путём внутри контейнера (например, `/workspace/project`).
+
+```toml
+[mcp_servers.code_obfuscator]
+enabled = true
 command = "docker"
 args = [
   "run", "--rm", "-i",
+  "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
+  "-e", "MCP_LOG_STDOUT=false",
+  "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
+  "-v", "/ABS/PATH/PROJECT_ROOT:/workspace/project:rw",
   "code-obfuscator-mcp:local"
 ]
 ```
 
-После этого перезапустите Codex CLI и проверьте, что сервер доступен в списке MCP-серверов.
+## Рекомендуемый workflow с LLM
 
-Если хотите запускать без Docker, можно указать бинарник напрямую:
+1. Получить структуру проекта (`list_project_tree`) и выбрать нужные файлы.
+2. Обфусцировать вход (`obfuscate_project_from_paths` или `obfuscate_project`).
+3. Дать LLM только `obfuscated_files`.
+4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и (опционально) `mapping_payload`.
+5. MCP сам деобфусцирует и применяет файлы на диск.
 
-```toml
-[mcp_servers.code_obfuscator]
-command = "cargo"
-args = ["run", "--manifest-path", "/ABS/PATH/code-obfuscator/Cargo.toml", "--bin", "mcp-server"]
-```
+## Контракты инструментов (кратко)
 
-В такой конфигурации LLM (включая GPT-5.x в Codex CLI) будет вызывать инструменты `obfuscate_project`/`deobfuscate_project` через ваш локальный MCP-сервер.
+### `list_project_tree`
+- Вход: `root_dir`, `max_depth?`, `max_entries?`, `include_hidden?`.
+- Выход: `entries[{path,kind}]`, `truncated`.
 
-### Default mapping на стороне MCP + HTTP API
+### `obfuscate_project_from_paths`
+- Вход: `root_dir`, `file_paths?`, `manual_mapping?`, `options?`.
+- MCP читает файлы с диска и возвращает тот же формат, что `obfuscate_project`.
 
-Сервер поддерживает дефолтный mapping, который применяется в `obfuscate_project`, если `manual_mapping` не передан клиентом.
+### `obfuscate_project`
+- Вход: `project_files`, `manual_mapping?`, `options?`.
+- Выход: `obfuscated_files`, `mapping_payload`, `stats`, `events`.
 
-Переменные окружения:
+### `apply_llm_output`
+- Вход: `root_dir`, `llm_output_files`, `mapping_payload?`, `options?`.
+- MCP делает deobfuscation внутри сервера и пишет восстановленные файлы в `root_dir`.
+- Выход: `applied_files`, `stats`, `events`.
+- Приоритет mapping: `mapping_payload` из запроса, иначе server default mapping.
 
-- `MCP_DEFAULT_MAPPING_PATH` — путь к JSON-файлу дефолтного mapping (например `./mapping.default.json`).
-- `MCP_HTTP_ADDR` — адрес HTTP API для runtime-управления mapping (например `127.0.0.1:18787`).
+## HTTP endpoints
 
-Пример запуска:
+- `GET /health`
+- `GET /mapping`
+- `PUT /mapping`
+- `POST /` (MCP JSON-RPC)
+- `POST /mcp` (MCP JSON-RPC alias)
 
-```bash
-MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
-MCP_HTTP_ADDR=127.0.0.1:18787 \
-cargo run --bin mcp-server
-```
+## Основные переменные окружения
 
-HTTP endpoints:
+- `MCP_DEFAULT_MAPPING_PATH`
+- `MCP_HTTP_ADDR`
+- `MCP_LOG_DIR`
+- `MCP_LOG_MAX_BYTES`
+- `MCP_LOG_MAX_FILES`
+- `MCP_LOG_STDOUT`
+- `MCP_ALLOW_DIRECT_DEOBFUSCATION` (default: `false`)
 
-- `GET /health` — healthcheck.
-- `GET /mapping` — получить текущий default mapping.
-- `PUT /mapping` — обновить default mapping.
-  - body может быть либо JSON-object mapping (`{"a":"b"}`),
-  - либо envelope (`{"mapping": {"a":"b"}}`).
-
-После `PUT /mapping` состояние обновляется в памяти и сохраняется в `MCP_DEFAULT_MAPPING_PATH` (если путь задан).
-
-Важно: приоритет для деобфускации такой: (1) `mapping_payload` из запроса, (2) fallback на default mapping сервера. Рекомендуемый и наиболее точный путь — передавать `mapping_payload` из `obfuscate_project`, чтобы восстановить именно тот вариант обфускации, который ушёл в LLM.
-
-Ограничения текущей версии MCP:
-- только текстовые файлы (`path + content`),
-- гибридная модель: и `obfuscate_project`, и `deobfuscate_project` могут использовать server-side default mapping; если передан `mapping_payload`, он имеет приоритет,
-- fail-fast при деобфускации, если обязательные обфусцированные токены отсутствуют в ответе LLM,
-- `--deep` не используется.
-
-## Makefile команды
-
-- `make build` - сборка.
-- `make test` - unit + integration (`tests/mcp_server.rs`) + e2e.
-- `make e2e` - только e2e.
-- `make svt` - нагрузочный blackbox тест (`ignored` по умолчанию, запуск вручную).
-- `make coverage` - отчёт покрытия через `cargo llvm-cov`.
-- `make release-cross` - сборка для macOS/Linux/Windows targets.
-- `make release-artifacts` - упаковка бинарников в `dist/`.
-- `make ci` - fmt + clippy + test + coverage.
-
-Перед первым `make coverage` установите инструмент:
+## Разработка
 
 ```bash
-cargo install cargo-llvm-cov
+make build
+make test
+cargo test --test mcp_server
 ```
-
-## CI/CD
-
-- `.github/workflows/ci.yml`: запускает Makefile-цель `make ci`.
-- `.github/workflows/release.yml`: по git-тегам `v*` публикует бинарники для Linux/Windows/macOS.
-
-## Тесты
-
-- Unit тесты: в модулях (`src/*.rs`) для language-aware логики.
-- E2E тесты: `tests/e2e.rs`, включая roundtrip для 10 языков и запуск доступных компиляторов/интерпретаторов.
-- SVT тесты: `tests/svt.rs` (`#[ignore]`, manual run).
-
-Целевое покрытие: >= 70% (контролируется в CI через `make coverage`).
-
-## Бизнес-кейсы
-
-- Безопасная передача кода в внешние LLM/AI-агенты без раскрытия доменных терминов.
-- Поддержка monorepo с несколькими языками без раздельных тулов на каждый язык.
-- Обратимая обфускация для безопасной интеграции AI-правок обратно в продуктовые репозитории.
-
-См. `SAMPLES.md` для примеров до/после.
-
-
-
-## Full compiler/runtime E2E environment
-
-`tests/e2e.rs` runs real compile/runtime checks for Python, JavaScript/TypeScript, Java, C++, Go, Rust, SQL, Bash and C# when toolchains are present.
-
-To run with a fully provisioned toolchain container (including .NET for C#), use:
-
-```bash
-./scripts/run-e2e-full.sh
-```
-
-This script builds `docker/e2e.Dockerfile` and executes `cargo test --tests` inside that image.

@@ -45,6 +45,15 @@ Prefer relative paths in references inside markdown files.
 
 Treat a user message that starts with a slash command as an explicit workflow invocation, not as a generic natural-language request.
 
+### Resolution priority
+
+Resolve user intent in this order:
+
+1. explicit slash command on the first non-empty line
+2. exact workflow `trigger:` match
+3. matching prompt example or prompt name in `.agent/prompts/`
+4. generic natural-language handling
+
 ### Dispatch contract
 
 - If the first non-empty line starts with `/command-name`, first look for an exact `trigger: /command-name` match in `project_dir/.agent/workflows/*.md`.
@@ -53,6 +62,7 @@ Treat a user message that starts with a slash command as an explicit workflow in
 - Do not ask whether the workflow should be used when the trigger matches exactly; assume the slash command is intentional.
 - If several files match, prefer the workflow whose `name:` matches the command name exactly; otherwise ask for clarification.
 - If no exact workflow match exists, fall back to the closest matching prompt in `.agent/prompts/*`; if still no match, handle the request normally.
+- After selecting a workflow, also load any files referenced by its frontmatter such as `related-rules:` and `uses-skills:` before implementation.
 
 ### Input parsing for slash commands
 
@@ -60,6 +70,51 @@ Treat a user message that starts with a slash command as an explicit workflow in
 - Treat the remaining lines as structured task context.
 - Preserve section labels in either English or Russian, including `Feature:`, `Фича:`, `Acceptance criteria:`, `Критерии приёмки:`, `Constraints:`, and `Ограничения:`.
 - Pass the parsed body into the workflow inputs without requiring the user to restate it in another format.
+- If the command includes an ID before the quoted title, treat it as a ticket or task identifier.
+- Preserve domain terms, enum values, API paths, payload shapes, and rollout constraints exactly as written by the user.
+
+### Canonical command map
+
+When these commands are used, prefer the mapped workflow file directly:
+
+- `/dev` -> `.agent/workflows/development-cycle-workflow.md`
+- `/develop-feature` -> `.agent/workflows/develop-feature.md`
+- `/develop-epic` -> `.agent/workflows/develop-epic.md`
+- `/debug-issue` -> `.agent/workflows/debug-issue.md`
+- `/create-endpoint` -> `.agent/workflows/create-endpoint.md`
+- `/add-migration` -> `.agent/workflows/add-migration.md`
+- `/refactor-module` -> `.agent/workflows/refactor-module.md`
+- `/test-feature` -> `.agent/workflows/test-feature.md`
+- `/code-review` -> `.agent/workflows/code-review-workflow.md`
+- `/project-setup` -> `.agent/workflows/project-setup-workflow.md`
+
+### Execution contract after dispatch
+
+- Once a slash command is matched to a workflow, execute the workflow instead of merely summarizing it.
+- Produce the workflow's expected deliverables when feasible: code changes, tests, docs, plans, reports, or review artifacts.
+- Prefer modifying the codebase and creating the referenced documents over describing what should be done abstractly.
+- Keep work aligned to the workflow's phases, but do not block on role names such as `@pm` or `@qa`; the agent should synthesize those responsibilities in one execution unless the user asks otherwise.
+- If information is missing but the task is still implementable with reasonable assumptions, proceed and state assumptions briefly.
+- If a missing detail could cause a breaking or unsafe implementation, pause and ask only the smallest clarifying question needed.
+
+### Feature-request defaults
+
+For `/develop-feature`, assume the user expects the agent to:
+
+- validate the request against acceptance criteria and constraints
+- inspect the current codebase before changing code
+- prepare or update design notes under `docs/<feature>/` when the workflow calls for them
+- implement the feature end to end across the needed layers
+- add or update automated tests
+- run relevant verification commands
+- summarize release and rollback risks at the end
+
+### Fallback and ambiguity rules
+
+- If the slash command exists but the body is underspecified, infer the smallest safe scope from the title and provided context.
+- If acceptance criteria are absent for `/develop-feature`, derive an initial checklist from the feature statement and surface it as assumptions while proceeding where safe.
+- If the user's body conflicts with the workflow template, prefer the user's explicit request.
+- Never ignore an exact slash command in favor of a generic workflow just because another prompt looks semantically similar.
 
 ### Examples
 

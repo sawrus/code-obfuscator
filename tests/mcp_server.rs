@@ -240,10 +240,10 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
                 "name":"obfuscate_project",
                 "arguments":{
                     "project_files":[
-                        {"path":"app/query.py","content":"QUERY = \"select * from mostbet.users\"\n"},
+                        {"path":"app/query.py","content":"QUERY = \"select * from bs.users\"\n"},
                         {"path":"app/readme.txt","content":"hello world\n"}
                     ],
-                    "manual_mapping":{"mostbet":"mmm"}
+                    "manual_mapping":{"bs":"mmm"}
                 }
             }
         }),
@@ -305,7 +305,7 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
     );
 
     let query = fs::read_to_string(project.join("app/query.py")).expect("query file");
-    assert!(query.contains("select id from mostbet.users"), "{query}");
+    assert!(query.contains("select id from bs.users"), "{query}");
     assert!(
         !project.join("app/readme.txt").exists(),
         "readme should not be written on subset apply"
@@ -342,8 +342,8 @@ fn mcp_apply_llm_output_rejects_unknown_subset_paths() {
                     "llm_output_files":[{"path":"other.py","content":"print('x')"}],
                     "mapping_payload":{
                         "mapping":{
-                            "forward":{"mostbet":"mmm"},
-                            "reverse":{"mmm":"mostbet"}
+                            "forward":{"bs":"mmm"},
+                            "reverse":{"mmm":"bs"}
                         },
                         "created_at_epoch_s": 1,
                         "metadata":{
@@ -389,8 +389,8 @@ fn mcp_apply_llm_output_fails_when_returned_file_loses_required_token() {
             "params":{
                 "name":"obfuscate_project",
                 "arguments":{
-                    "project_files":[{"path":"app/query.py","content":"select * from mostbet.users\n"}],
-                    "manual_mapping":{"mostbet":"mmm"}
+                    "project_files":[{"path":"app/query.py","content":"select * from bs.users\n"}],
+                    "manual_mapping":{"bs":"mmm"}
                 }
             }
         }),
@@ -793,7 +793,7 @@ fn mcp_obfuscate_project_from_paths_reads_files_in_mcp() {
     fs::create_dir_all(project.join("app")).expect("mkdirs");
     fs::write(
         project.join("app/query.py"),
-        "QUERY_1 = \"\"\"\nselect 1 from mostbet.users u where u.id in %(mostbet_user_ids)s\n\"\"\"\n",
+        "QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
     )
     .expect("write file");
 
@@ -818,7 +818,7 @@ fn mcp_obfuscate_project_from_paths_reads_files_in_mcp() {
                 "arguments":{
                     "root_dir": project.to_string_lossy().to_string(),
                     "file_paths":["app/query.py"],
-                    "manual_mapping":{"mostbet":"mmm"}
+                    "manual_mapping":{"bs":"mmm"}
                 }
             }
         }),
@@ -846,7 +846,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     fs::create_dir_all(project.join("app")).expect("mkdirs");
     fs::write(
         project.join("app/query.py"),
-        "QUERY_1 = \"\"\"\nselect 1 from mmm.users u where u.id in %(mostbet_user_ids)s\n\"\"\"\n",
+        "QUERY_1 = \"\"\"\nselect 1 from mmm.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
     )
     .expect("write file");
 
@@ -874,8 +874,8 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
                     "file_paths":["app/query.py"],
                     "mapping_payload":{
                         "mapping":{
-                            "forward":{"mostbet":"mmm"},
-                            "reverse":{"mmm":"mostbet"}
+                            "forward":{"bs":"mmm"},
+                            "reverse":{"mmm":"bs"}
                         },
                         "created_at_epoch_s": 1
                     }
@@ -893,7 +893,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     let content = payload["restored_files"][0]["content"]
         .as_str()
         .expect("content");
-    assert!(content.contains("select 1 from mostbet.users"), "{payload}");
+    assert!(content.contains("select 1 from bs.users"), "{payload}");
 
     drop(stdin);
     let _ = child.wait();
@@ -993,7 +993,7 @@ fn mcp_http_jsonrpc_over_root_and_mcp_path() {
     let _guard = http_test_lock();
     let dir = tempdir().expect("tmp");
     let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"mostbet":"mmm"}"#).expect("write mapping");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -1024,7 +1024,7 @@ fn mcp_http_jsonrpc_over_root_and_mcp_path() {
         "params":{
             "name":"obfuscate_project",
             "arguments":{
-                "project_files":[{"path":"query.py","content":"QUERY_1 = \"\"\"\nselect 1 from mostbet.users u where u.id in %(mostbet_user_ids)s\n\"\"\"\n"}]
+                "project_files":[{"path":"query.py","content":"QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n"}]
             }
         }
     });
@@ -1231,8 +1231,8 @@ fn mcp_log_file_rotation() {
                 "params":{
                     "name":"obfuscate_project",
                     "arguments":{
-                        "project_files":[{"path":"q.sql","content": format!("select 1 from mostbet.users where name = '{}'", "x".repeat(80))}],
-                        "manual_mapping":{"mostbet":"mmm"}
+                        "project_files":[{"path":"q.sql","content": format!("select 1 from bs.users where name = '{}'", "x".repeat(80))}],
+                        "manual_mapping":{"bs":"mmm"}
                     }
                 }
             }),

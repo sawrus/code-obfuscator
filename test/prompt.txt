@@ -1,0 +1,26 @@
+Работай только через MCP `code_obfuscator`.
+Цель: переделать проект `test` по моим дальнейшим требованиям, применяя изменения через MCP.
+
+Правила работы:
+1) Не читай содержимое файлов проекта напрямую (никаких локальных `cat/read` по коду).
+2) Используй только MCP-инструменты:
+   - `list_project_tree`
+   - `obfuscate_project_from_paths`
+   - `apply_llm_output`
+3) Прямые инструменты деобфускации (`deobfuscate_project*`) не используй.
+
+Порядок:
+1) Сначала вызови `tools/list` и проверь, что инструменты доступны.
+2) Используй `root_dir="/workspace/projects/ai/codex/code-obfuscator/test"`.
+3) Вызови `list_project_tree(root_dir=...)` и выбери релевантные файлы.
+4) Вызови `obfuscate_project_from_paths(root_dir=..., file_paths=[...])`.
+5) Выполни изменения только по `obfuscated_files`.
+6) Передай результат в
+   `apply_llm_output(root_dir=..., llm_output_files=[...], mapping_payload=...)`
+   (используй `mapping_payload` из шага обфускации).
+7) В ответе покажи:
+   - какие файлы применены (`applied_files`),
+   - что именно изменено по смыслу,
+   - какие проверки/команды запущены.
+
+Если MCP недоступен, нет прав записи или tool-call падает — остановись и дай точную ошибку.

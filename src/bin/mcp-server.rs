@@ -30,13 +30,19 @@ use mapping::{MappingFile, detect_terms, enrich_with_random, invert};
 use mcp_logging::{LogEvent, McpLogger};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use walkdir::WalkDir;
 
 const MAX_FILES_PER_PROJECT: usize = 1_000_000;
+const DEFAULT_TREE_MAX_DEPTH: usize = 6;
+const DEFAULT_TREE_MAX_ENTRIES: usize = 1_000;
+const MAX_TREE_MAX_DEPTH: usize = 32;
+const MAX_TREE_MAX_ENTRIES: usize = 20_000;
 
 #[derive(Clone)]
 struct AppState {
     default_mapping: MappingStore,
     logger: McpLogger,
+    allow_direct_deobfuscation: bool,
 }
 
 #[derive(Clone)]
@@ -89,7 +95,7 @@ struct JsonRpcRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdioFraming {
     ContentLength,
-    JsonLine,
+    JsonStream,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,11 +131,49 @@ struct ObfuscateArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ObfuscateFromPathsArgs {
+    root_dir: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    #[serde(default)]
+    manual_mapping: BTreeMap<String, String>,
+    #[serde(default)]
+    options: ToolOptions,
+}
+
+#[derive(Debug, Deserialize)]
 struct DeobfuscateArgs {
     llm_output_files: Vec<ProjectFile>,
     mapping_payload: Option<MappingPayload>,
     #[serde(default)]
     options: ToolOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeobfuscateFromPathsArgs {
+    root_dir: String,
+    #[serde(default)]
+    file_paths: Vec<String>,
+    mapping_payload: Option<MappingPayload>,
+    #[serde(default)]
+    options: ToolOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyLlmOutputArgs {
+    root_dir: String,
+    llm_output_files: Vec<ProjectFile>,
+    mapping_payload: Option<MappingPayload>,
+    #[serde(default)]
+    options: ToolOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListProjectTreeArgs {
+    root_dir: String,
+    max_depth: Option<usize>,
+    max_entries: Option<usize>,
+    include_hidden: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -174,6 +218,14 @@ struct DeobfuscateResult {
 }
 
 #[derive(Debug, Serialize)]
+struct ApplyLlmOutputResult {
+    request_id: String,
+    applied_files: Vec<String>,
+    stats: Stats,
+    events: Vec<StageEvent>,
+}
+
+#[derive(Debug, Serialize)]
 struct Stats {
     file_count: usize,
     mapping_entries: usize,
@@ -183,6 +235,19 @@ struct Stats {
 struct StageEvent {
     stage: &'static str,
     timestamp_epoch_s: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TreeEntry {
+    path: String,
+    kind: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectTreeResult {
+    root_dir: String,
+    entries: Vec<TreeEntry>,
+    truncated: bool,
 }
 
 fn main() {
@@ -195,9 +260,12 @@ fn main() {
 fn run() -> AppResult<()> {
     let logger = McpLogger::from_env()?;
     let mapping_path = env::var("MCP_DEFAULT_MAPPING_PATH").ok().map(PathBuf::from);
+    let allow_direct_deobfuscation =
+        parse_env_bool("MCP_ALLOW_DIRECT_DEOBFUSCATION").unwrap_or(false);
     let state = AppState {
         default_mapping: MappingStore::new(mapping_path),
         logger,
+        allow_direct_deobfuscation,
     };
 
     state.logger.log(LogEvent {
@@ -708,12 +776,20 @@ fn json_value_to_string(v: &Value) -> String {
 
 fn handle_request(req: JsonRpcRequest, state: &AppState) -> AppResult<Value> {
     match req.method.as_str() {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": {"name": "code-obfuscator-mcp", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"tools": {"listChanged": false}}
-        })),
-        "tools/list" => Ok(json!({"tools": tools_definitions()})),
+        "initialize" => {
+            let protocol_version = negotiate_protocol_version(&req.params);
+            Ok(json!({
+                "protocolVersion": protocol_version,
+                "serverInfo": {"name": "code-obfuscator-mcp", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {
+                    "tools": {"listChanged": false},
+                    "resources": {"subscribe": false, "listChanged": false}
+                }
+            }))
+        }
+        "resources/list" => Ok(json!({"resources": []})),
+        "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
+        "tools/list" => Ok(json!({"tools": tools_definitions(state.allow_direct_deobfuscation)})),
         "tools/call" => {
             let params: ToolCallParams = serde_json::from_value(req.params)?;
             call_tool(params, state)
@@ -722,27 +798,320 @@ fn handle_request(req: JsonRpcRequest, state: &AppState) -> AppResult<Value> {
     }
 }
 
-fn tools_definitions() -> Vec<Value> {
-    vec![
+fn negotiate_protocol_version(params: &Value) -> String {
+    if let Some(version) = params.get("protocolVersion").and_then(Value::as_str) {
+        return version.to_string();
+    }
+    if let Some(versions) = params.get("protocolVersions").and_then(Value::as_array)
+        && let Some(version) = versions.iter().find_map(Value::as_str)
+    {
+        return version.to_string();
+    }
+    "2024-11-05".to_string()
+}
+
+fn tools_definitions(allow_direct_deobfuscation: bool) -> Vec<Value> {
+    let mut tools = vec![
+        json!({"name":"list_project_tree","description":"List directory structure for a project root. Reads only metadata (paths/types), not file contents.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"max_depth":{"type":"integer","minimum":1},"max_entries":{"type":"integer","minimum":1},"include_hidden":{"type":"boolean"}}}}),
+        json!({"name":"obfuscate_project_from_paths","description":"Read project files from disk inside MCP by root_dir + file_paths and obfuscate them before sending to LLM.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
         json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
-        json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
-    ]
+        json!({"name":"apply_llm_output","description":"Accept LLM-produced obfuscated files, deobfuscate inside MCP, and write restored files to root_dir. Returns only applied paths and metadata.","inputSchema":{"type":"object","required":["root_dir","llm_output_files"],"properties":{"root_dir":{"type":"string"},"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
+    ];
+    if allow_direct_deobfuscation {
+        tools.push(json!({"name":"deobfuscate_project_from_paths","description":"Read obfuscated files from disk inside MCP by root_dir + file_paths and deobfuscate them.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
+        tools.push(json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
+    }
+    tools
 }
 
 fn call_tool(params: ToolCallParams, state: &AppState) -> AppResult<Value> {
     match params.name.as_str() {
+        "list_project_tree" => {
+            let args: ListProjectTreeArgs = serde_json::from_value(params.arguments)?;
+            let result = list_project_tree(args)?;
+            Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
+        }
+        "obfuscate_project_from_paths" => {
+            let args: ObfuscateFromPathsArgs = serde_json::from_value(params.arguments)?;
+            let result = obfuscate_project_from_paths(args, state)?;
+            Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
+        }
+        "deobfuscate_project_from_paths" => {
+            if !state.allow_direct_deobfuscation {
+                return Err(AppError::InvalidArg(
+                    "direct deobfuscation tools are disabled; use apply_llm_output".into(),
+                ));
+            }
+            let args: DeobfuscateFromPathsArgs = serde_json::from_value(params.arguments)?;
+            let result = deobfuscate_project_from_paths(args, state)?;
+            Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
+        }
         "obfuscate_project" => {
             let args: ObfuscateArgs = serde_json::from_value(params.arguments)?;
             let result = obfuscate_project(args, state)?;
             Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
         }
+        "apply_llm_output" => {
+            let args: ApplyLlmOutputArgs = serde_json::from_value(params.arguments)?;
+            let result = apply_llm_output(args, state)?;
+            Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
+        }
         "deobfuscate_project" => {
+            if !state.allow_direct_deobfuscation {
+                return Err(AppError::InvalidArg(
+                    "direct deobfuscation tools are disabled; use apply_llm_output".into(),
+                ));
+            }
             let args: DeobfuscateArgs = serde_json::from_value(params.arguments)?;
             let result = deobfuscate_project(args, state)?;
             Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}]}))
         }
-        _ => Err(AppError::InvalidArg("unknown tool".into())),
+        _ => Err(AppError::InvalidArg("unknown or disabled tool".into())),
     }
+}
+
+fn list_project_tree(args: ListProjectTreeArgs) -> AppResult<ProjectTreeResult> {
+    let root = resolve_root_dir(&args.root_dir)?;
+    let max_depth = args
+        .max_depth
+        .unwrap_or(DEFAULT_TREE_MAX_DEPTH)
+        .min(MAX_TREE_MAX_DEPTH);
+    let max_entries = args
+        .max_entries
+        .unwrap_or(DEFAULT_TREE_MAX_ENTRIES)
+        .min(MAX_TREE_MAX_ENTRIES);
+    let include_hidden = args.include_hidden.unwrap_or(false);
+
+    let mut entries = Vec::new();
+    let mut truncated = false;
+
+    for entry in WalkDir::new(&root)
+        .max_depth(max_depth)
+        .into_iter()
+        .flatten()
+    {
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .map_err(|_| AppError::InvalidArg("invalid path under root".into()))?;
+        if !include_hidden && is_hidden_path(rel) {
+            continue;
+        }
+
+        let kind = if entry.file_type().is_dir() {
+            "dir"
+        } else if entry.file_type().is_file() {
+            "file"
+        } else {
+            continue;
+        };
+
+        entries.push(TreeEntry {
+            path: rel.to_string_lossy().to_string(),
+            kind,
+        });
+        if entries.len() >= max_entries {
+            truncated = true;
+            break;
+        }
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(ProjectTreeResult {
+        root_dir: root.to_string_lossy().to_string(),
+        entries,
+        truncated,
+    })
+}
+
+fn obfuscate_project_from_paths(
+    args: ObfuscateFromPathsArgs,
+    state: &AppState,
+) -> AppResult<ObfuscateResult> {
+    let project_files = load_project_files_from_disk(&args.root_dir, &args.file_paths)?;
+    obfuscate_project(
+        ObfuscateArgs {
+            project_files,
+            manual_mapping: args.manual_mapping,
+            options: args.options,
+        },
+        state,
+    )
+}
+
+fn deobfuscate_project_from_paths(
+    args: DeobfuscateFromPathsArgs,
+    state: &AppState,
+) -> AppResult<DeobfuscateResult> {
+    let llm_output_files = load_project_files_from_disk(&args.root_dir, &args.file_paths)?;
+    deobfuscate_project(
+        DeobfuscateArgs {
+            llm_output_files,
+            mapping_payload: args.mapping_payload,
+            options: args.options,
+        },
+        state,
+    )
+}
+
+fn apply_llm_output(args: ApplyLlmOutputArgs, state: &AppState) -> AppResult<ApplyLlmOutputResult> {
+    let root = resolve_root_dir(&args.root_dir)?;
+    let deobfuscated = deobfuscate_project(
+        DeobfuscateArgs {
+            llm_output_files: args.llm_output_files,
+            mapping_payload: args.mapping_payload,
+            options: args.options,
+        },
+        state,
+    )?;
+
+    let mut events = deobfuscated.events;
+    record_event(&mut events, "applying");
+    write_project_files_to_disk(&root, &deobfuscated.restored_files)?;
+    record_event(&mut events, "applied");
+
+    let applied_files = deobfuscated
+        .restored_files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
+    Ok(ApplyLlmOutputResult {
+        request_id: deobfuscated.request_id,
+        applied_files,
+        stats: deobfuscated.stats,
+        events,
+    })
+}
+
+fn load_project_files_from_disk(
+    root_dir: &str,
+    file_paths: &[String],
+) -> AppResult<Vec<ProjectFile>> {
+    let root = resolve_root_dir(root_dir)?;
+    if file_paths.is_empty() {
+        let entries = fs_ops::read_text_tree(&root)?;
+        return Ok(entries
+            .into_iter()
+            .map(|entry| ProjectFile {
+                path: entry.rel.to_string_lossy().to_string(),
+                content: entry.text,
+            })
+            .collect());
+    }
+
+    let mut files = Vec::with_capacity(file_paths.len());
+    for rel in file_paths {
+        let full = resolve_path_under_root(&root, rel)?;
+        let text = fs::read_to_string(&full)
+            .map_err(|_| AppError::InvalidArg(format!("failed to read UTF-8 file: {rel}")))?;
+        let rel_path = full
+            .strip_prefix(&root)
+            .map_err(|_| AppError::InvalidArg("path is outside project root".into()))?;
+        files.push(ProjectFile {
+            path: rel_path.to_string_lossy().to_string(),
+            content: text,
+        });
+    }
+    Ok(files)
+}
+
+fn write_project_files_to_disk(root: &Path, files: &[ProjectFile]) -> AppResult<()> {
+    for file in files {
+        let out = resolve_write_path_under_root(root, &file.path)?;
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+            let canonical_parent = parent.canonicalize().map_err(|_| {
+                AppError::InvalidArg(format!("invalid parent path: {}", parent.display()))
+            })?;
+            if !canonical_parent.starts_with(root) {
+                return Err(AppError::InvalidArg("write path escapes root_dir".into()));
+            }
+        }
+        if out.exists() {
+            let meta = fs::symlink_metadata(&out)?;
+            if meta.file_type().is_symlink() {
+                return Err(AppError::InvalidArg(format!(
+                    "refusing to write through symlink: {}",
+                    file.path
+                )));
+            }
+            if meta.is_dir() {
+                return Err(AppError::InvalidArg(format!(
+                    "path points to directory, expected file: {}",
+                    file.path
+                )));
+            }
+        }
+        fs::write(out, &file.content)?;
+    }
+    Ok(())
+}
+
+fn resolve_write_path_under_root(root: &Path, rel_path: &str) -> AppResult<PathBuf> {
+    validate_rel_path(rel_path)?;
+    let out = root.join(rel_path);
+    let parent = out
+        .parent()
+        .ok_or_else(|| AppError::InvalidArg("file path must include parent directory".into()))?;
+    if !parent.exists() {
+        fs::create_dir_all(parent)?;
+    }
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|_| AppError::InvalidArg(format!("failed to resolve parent: {rel_path}")))?;
+    if !canonical_parent.starts_with(root) {
+        return Err(AppError::InvalidArg(
+            "path traversal outside root_dir is not allowed".into(),
+        ));
+    }
+    Ok(out)
+}
+
+fn resolve_root_dir(root_dir: &str) -> AppResult<PathBuf> {
+    if root_dir.trim().is_empty() {
+        return Err(AppError::InvalidArg("root_dir cannot be empty".into()));
+    }
+    let root = PathBuf::from(root_dir)
+        .canonicalize()
+        .map_err(|_| AppError::InvalidArg(format!("root_dir does not exist: {root_dir}")))?;
+    if !root.is_dir() {
+        return Err(AppError::InvalidArg(format!(
+            "root_dir is not a directory: {root_dir}"
+        )));
+    }
+    Ok(root)
+}
+
+fn resolve_path_under_root(root: &Path, rel_path: &str) -> AppResult<PathBuf> {
+    validate_rel_path(rel_path)?;
+    let full = root.join(rel_path);
+    let canonical = full
+        .canonicalize()
+        .map_err(|_| AppError::InvalidArg(format!("file does not exist: {rel_path}")))?;
+    if !canonical.starts_with(root) {
+        return Err(AppError::InvalidArg(
+            "path traversal outside root_dir is not allowed".into(),
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(AppError::InvalidArg(format!(
+            "path is not a file: {rel_path}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .map(|s| s.starts_with('.'))
+            .unwrap_or(false)
+    })
 }
 
 fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<ObfuscateResult> {
@@ -987,6 +1356,15 @@ fn sign_payload(payload: &MappingPayload) -> AppResult<String> {
     Ok(format!("{:x}", hasher.finish()))
 }
 
+fn parse_env_bool(key: &str) -> Option<bool> {
+    env::var(key).ok().map(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn now_epoch_s() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1001,9 +1379,8 @@ fn read_message<R: BufRead>(
     match framing {
         Some(StdioFraming::ContentLength) => read_message_content_length(reader)
             .map(|opt| opt.map(|req| (req, StdioFraming::ContentLength))),
-        Some(StdioFraming::JsonLine) => {
-            read_message_json_line(reader).map(|opt| opt.map(|req| (req, StdioFraming::JsonLine)))
-        }
+        Some(StdioFraming::JsonStream) => read_message_json_stream(reader)
+            .map(|opt| opt.map(|req| (req, StdioFraming::JsonStream))),
         None => read_message_auto(reader),
     }
 }
@@ -1011,6 +1388,17 @@ fn read_message<R: BufRead>(
 fn read_message_auto<R: BufRead>(
     reader: &mut R,
 ) -> AppResult<Option<(JsonRpcRequest, StdioFraming)>> {
+    let first = match read_non_whitespace_byte(reader)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    if first == b'{' || first == b'[' {
+        let req = read_json_request_from_first(reader, first)?;
+        return Ok(Some((req, StdioFraming::JsonStream)));
+    }
+
+    let mut content_len = parse_content_length_header(&read_line_with_first_byte(reader, first)?)?;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
@@ -1019,37 +1407,18 @@ fn read_message_auto<R: BufRead>(
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
-            continue;
+            break;
         }
-
-        if trimmed.starts_with('{') {
-            let req: JsonRpcRequest = serde_json::from_str(trimmed)?;
-            return Ok(Some((req, StdioFraming::JsonLine)));
+        if let Some(parsed) = parse_content_length_header(trimmed)? {
+            content_len = Some(parsed);
         }
-
-        let mut content_len = parse_content_length_header(trimmed)?;
-        loop {
-            let mut next_line = String::new();
-            let n = reader.read_line(&mut next_line)?;
-            if n == 0 {
-                return Ok(None);
-            }
-            let trimmed_next = next_line.trim_end();
-            if trimmed_next.is_empty() {
-                break;
-            }
-            if let Some(parsed) = parse_content_length_header(trimmed_next)? {
-                content_len = Some(parsed);
-            }
-        }
-
-        let len =
-            content_len.ok_or_else(|| AppError::InvalidArg("missing Content-Length".into()))?;
-        let mut body = vec![0_u8; len];
-        reader.read_exact(&mut body)?;
-        let req: JsonRpcRequest = serde_json::from_slice(&body)?;
-        return Ok(Some((req, StdioFraming::ContentLength)));
     }
+
+    let len = content_len.ok_or_else(|| AppError::InvalidArg("missing Content-Length".into()))?;
+    let mut body = vec![0_u8; len];
+    reader.read_exact(&mut body)?;
+    let req: JsonRpcRequest = serde_json::from_slice(&body)?;
+    Ok(Some((req, StdioFraming::ContentLength)))
 }
 
 fn read_message_content_length<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
@@ -1076,19 +1445,105 @@ fn read_message_content_length<R: BufRead>(reader: &mut R) -> AppResult<Option<J
     Ok(Some(req))
 }
 
-fn read_message_json_line<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
+fn read_message_json_stream<R: BufRead>(reader: &mut R) -> AppResult<Option<JsonRpcRequest>> {
+    let first = match read_non_whitespace_byte(reader)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    read_json_request_from_first(reader, first).map(Some)
+}
+
+fn read_non_whitespace_byte<R: BufRead>(reader: &mut R) -> AppResult<Option<u8>> {
+    let mut byte = [0_u8; 1];
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        let n = reader.read(&mut byte)?;
         if n == 0 {
             return Ok(None);
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if !byte[0].is_ascii_whitespace() {
+            return Ok(Some(byte[0]));
+        }
+    }
+}
+
+fn read_line_with_first_byte<R: BufRead>(reader: &mut R, first: u8) -> AppResult<String> {
+    let mut line = vec![first];
+    let mut byte = [0_u8; 1];
+    loop {
+        let n = reader.read(&mut byte)?;
+        if n == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).trim_end().to_string())
+}
+
+fn read_json_request_from_first<R: BufRead>(
+    reader: &mut R,
+    first: u8,
+) -> AppResult<JsonRpcRequest> {
+    if first != b'{' && first != b'[' {
+        return Err(AppError::InvalidArg(
+            "unsupported stdio JSON framing".into(),
+        ));
+    }
+
+    let mut bytes = vec![first];
+    let mut depth: i32 = 1;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut byte = [0_u8; 1];
+
+    while depth > 0 {
+        let n = reader.read(&mut byte)?;
+        if n == 0 {
+            return Err(AppError::InvalidArg(
+                "unexpected EOF while reading JSON-RPC message".into(),
+            ));
+        }
+        let b = byte[0];
+        bytes.push(b);
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if b == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
             continue;
         }
-        let req: JsonRpcRequest = serde_json::from_str(trimmed)?;
-        return Ok(Some(req));
+
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    let value: Value = serde_json::from_slice(&bytes)?;
+    match value {
+        Value::Object(_) => Ok(serde_json::from_value(value)?),
+        Value::Array(mut items) => {
+            if items.is_empty() {
+                Err(AppError::InvalidArg(
+                    "empty JSON-RPC batch is not supported".into(),
+                ))
+            } else {
+                Ok(serde_json::from_value(items.remove(0))?)
+            }
+        }
+        _ => Err(AppError::InvalidArg("invalid JSON-RPC payload".into())),
     }
 }
 
@@ -1117,7 +1572,7 @@ fn write_message<W: Write>(
             writer.write_all(header.as_bytes())?;
             writer.write_all(&body)?;
         }
-        StdioFraming::JsonLine => {
+        StdioFraming::JsonStream => {
             writer.write_all(&body)?;
             writer.write_all(b"\n")?;
         }

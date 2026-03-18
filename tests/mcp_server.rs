@@ -215,6 +215,223 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
 }
 
 #[test]
+fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[
+                        {"path":"app/query.py","content":"QUERY = \"select * from mostbet.users\"\n"},
+                        {"path":"app/readme.txt","content":"hello world\n"}
+                    ],
+                    "manual_mapping":{"mostbet":"mmm"}
+                }
+            }
+        }),
+    );
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+
+    let text = obf_response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text payload");
+    let payload: Value = serde_json::from_str(text).expect("parse tool result");
+    let mapping_payload = payload["mapping_payload"].clone();
+    let query_file = payload["obfuscated_files"]
+        .as_array()
+        .expect("obfuscated files")
+        .iter()
+        .find(|file| file["path"] == "app/query.py")
+        .cloned()
+        .expect("query file")
+        .as_object()
+        .cloned()
+        .expect("query file object");
+
+    let mut query_file = Value::Object(query_file);
+    query_file["content"] = Value::String(
+        query_file["content"]
+            .as_str()
+            .expect("content")
+            .replace("select *", "select id"),
+    );
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":4,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "llm_output_files": [query_file],
+                    "mapping_payload": mapping_payload
+                }
+            }
+        }),
+    );
+    let apply_response = read_response(&mut stdout);
+    assert!(apply_response.get("error").is_none(), "{apply_response}");
+
+    let apply_text = apply_response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("apply text payload");
+    let applied: Value = serde_json::from_str(apply_text).expect("applied payload");
+    assert_eq!(
+        applied["applied_files"],
+        json!(["app/query.py"]),
+        "{applied}"
+    );
+
+    let query = fs::read_to_string(project.join("app/query.py")).expect("query file");
+    assert!(query.contains("select id from mostbet.users"), "{query}");
+    assert!(
+        !project.join("app/readme.txt").exists(),
+        "readme should not be written on subset apply"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_apply_llm_output_rejects_unknown_subset_paths() {
+    let dir = tempdir().expect("tmp");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":5,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": dir.path().to_string_lossy().to_string(),
+                    "llm_output_files":[{"path":"other.py","content":"print('x')"}],
+                    "mapping_payload":{
+                        "mapping":{
+                            "forward":{"mostbet":"mmm"},
+                            "reverse":{"mmm":"mostbet"}
+                        },
+                        "created_at_epoch_s": 1,
+                        "metadata":{
+                            "original_paths":["app/query.py"],
+                            "file_tokens":{"app/query.py":["mmm"]}
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    let error = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown file path"), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_apply_llm_output_fails_when_returned_file_loses_required_token() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"app/query.py","content":"select * from mostbet.users\n"}],
+                    "manual_mapping":{"mostbet":"mmm"}
+                }
+            }
+        }),
+    );
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+
+    let text = obf_response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text payload");
+    let payload: Value = serde_json::from_str(text).expect("parse tool result");
+    let mapping_payload = payload["mapping_payload"].clone();
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "llm_output_files":[{"path":"app/query.py","content":"select * from users\n"}],
+                    "mapping_payload": mapping_payload
+                }
+            }
+        }),
+    );
+    let response = read_response(&mut stdout);
+    let error = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("missing in LLM output for file 'app/query.py'"),
+        "{response}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn mcp_stdio_handshake_works_with_default_logging_config() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .stdin(Stdio::piped())

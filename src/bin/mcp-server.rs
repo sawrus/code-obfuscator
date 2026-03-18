@@ -15,7 +15,7 @@ mod obfuscator;
 
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -198,6 +198,16 @@ struct MappingPayload {
     expires_at_epoch_s: Option<u64>,
     signature: Option<String>,
     encryption: Option<String>,
+    #[serde(default)]
+    metadata: Option<MappingMetadata>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MappingMetadata {
+    #[serde(default)]
+    original_paths: Vec<String>,
+    #[serde(default)]
+    file_tokens: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -815,7 +825,7 @@ fn tools_definitions(allow_direct_deobfuscation: bool) -> Vec<Value> {
         json!({"name":"list_project_tree","description":"List directory structure for a project root. Reads only metadata (paths/types), not file contents.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"max_depth":{"type":"integer","minimum":1},"max_entries":{"type":"integer","minimum":1},"include_hidden":{"type":"boolean"}}}}),
         json!({"name":"obfuscate_project_from_paths","description":"Read project files from disk inside MCP by root_dir + file_paths and obfuscate them before sending to LLM.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
         json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
-        json!({"name":"apply_llm_output","description":"Accept LLM-produced obfuscated files, deobfuscate inside MCP, and write restored files to root_dir. Returns only applied paths and metadata.","inputSchema":{"type":"object","required":["root_dir","llm_output_files"],"properties":{"root_dir":{"type":"string"},"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
+        json!({"name":"apply_llm_output","description":"Accept LLM-produced obfuscated files, deobfuscate inside MCP, and write restored files to root_dir. Supports applying either the full obfuscated file set or only a changed subset. Returns only applied paths and metadata.","inputSchema":{"type":"object","required":["root_dir","llm_output_files"],"properties":{"root_dir":{"type":"string"},"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
     ];
     if allow_direct_deobfuscation {
         tools.push(json!({"name":"deobfuscate_project_from_paths","description":"Read obfuscated files from disk inside MCP by root_dir + file_paths and deobfuscate them.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
@@ -967,6 +977,8 @@ fn apply_llm_output(args: ApplyLlmOutputArgs, state: &AppState) -> AppResult<App
         },
         state,
     )?;
+
+    ensure_root_is_writable_for_files(&root, &deobfuscated.restored_files)?;
 
     let mut events = deobfuscated.events;
     record_event(&mut events, "applying");
@@ -1155,7 +1167,7 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
     let mut mapping_payload = MappingPayload {
         mapping: MappingFile {
             forward: forward_map.clone(),
-            reverse,
+            reverse: reverse.clone(),
         },
         created_at_epoch_s,
         expires_at_epoch_s: args.options.security.as_ref().and_then(|s| {
@@ -1164,6 +1176,7 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
         }),
         signature: None,
         encryption: None,
+        metadata: Some(build_mapping_metadata(&obfuscated_files, &reverse)),
     };
 
     if args
@@ -1212,7 +1225,7 @@ fn deobfuscate_project(args: DeobfuscateArgs, state: &AppState) -> AppResult<Deo
     validate_mapping_payload(&mapping_payload)?;
 
     let files = to_file_entries(&args.llm_output_files)?;
-    fail_fast_on_missing_tokens(&files, &mapping_payload.mapping.reverse)?;
+    fail_fast_on_missing_tokens(&args.llm_output_files, &mapping_payload)?;
 
     record_event(&mut events, "deobfuscating");
     let transformed = obfuscator::transform_files_global(&files, &mapping_payload.mapping.reverse)?;
@@ -1252,6 +1265,7 @@ fn resolve_deobfuscation_mapping(
         expires_at_epoch_s: None,
         signature: None,
         encryption: None,
+        metadata: None,
     })
 }
 
@@ -1263,22 +1277,126 @@ fn record_event(events: &mut Vec<StageEvent>, stage: &'static str) {
 }
 
 fn fail_fast_on_missing_tokens(
-    files: &[FileEntry],
-    reverse_map: &BTreeMap<String, String>,
+    files: &[ProjectFile],
+    mapping_payload: &MappingPayload,
 ) -> AppResult<()> {
-    let corpus = files
-        .iter()
-        .map(|f| f.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    for token in reverse_map.keys() {
-        if !corpus.contains(token) {
+    let Some(metadata) = &mapping_payload.metadata else {
+        let corpus = files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for token in mapping_payload.mapping.reverse.keys() {
+            if !corpus.contains(token) {
+                return Err(AppError::InvalidArg(format!(
+                    "fail-fast: obfuscated token '{token}' is missing in LLM output"
+                )));
+            }
+        }
+        return Ok(());
+    };
+
+    for file in files {
+        if !metadata
+            .original_paths
+            .iter()
+            .any(|path| path == &file.path)
+        {
             return Err(AppError::InvalidArg(format!(
-                "fail-fast: obfuscated token '{token}' is missing in LLM output"
+                "apply_llm_output received unknown file path '{}' ; expected a subset of {:?}",
+                file.path, metadata.original_paths
             )));
+        }
+
+        let expected_tokens = metadata
+            .file_tokens
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_default();
+        for token in expected_tokens {
+            if !file.content.contains(&token) {
+                return Err(AppError::InvalidArg(format!(
+                    "fail-fast: obfuscated token '{token}' is missing in LLM output for file '{}'",
+                    file.path
+                )));
+            }
         }
     }
     Ok(())
+}
+
+fn build_mapping_metadata(
+    obfuscated_files: &[ProjectFile],
+    reverse_map: &BTreeMap<String, String>,
+) -> MappingMetadata {
+    let mut original_paths = Vec::with_capacity(obfuscated_files.len());
+    let mut file_tokens = BTreeMap::new();
+
+    for file in obfuscated_files {
+        original_paths.push(file.path.clone());
+        let tokens = reverse_map
+            .keys()
+            .filter(|token| file.content.contains(token.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !tokens.is_empty() {
+            file_tokens.insert(file.path.clone(), tokens);
+        }
+    }
+
+    MappingMetadata {
+        original_paths,
+        file_tokens,
+    }
+}
+
+fn ensure_root_is_writable_for_files(root: &Path, files: &[ProjectFile]) -> AppResult<()> {
+    let mut checked_dirs = BTreeMap::<PathBuf, ()>::new();
+
+    for file in files {
+        let out = resolve_write_path_under_root(root, &file.path)?;
+        let mut probe_dir = out
+            .parent()
+            .ok_or_else(|| AppError::InvalidArg("file path must include parent directory".into()))?
+            .to_path_buf();
+        while !probe_dir.exists() {
+            probe_dir = probe_dir
+                .parent()
+                .ok_or_else(|| {
+                    AppError::InvalidArg(format!(
+                        "failed to resolve writable parent for {}",
+                        file.path
+                    ))
+                })?
+                .to_path_buf();
+        }
+        if checked_dirs.contains_key(&probe_dir) {
+            continue;
+        }
+        checked_dirs.insert(probe_dir.clone(), ());
+        assert_dir_is_writable(root, &probe_dir, &file.path)?;
+    }
+
+    Ok(())
+}
+
+fn assert_dir_is_writable(root: &Path, dir: &Path, rel_path: &str) -> AppResult<()> {
+    let probe_name = format!(".mcp-write-check-{}-{}", std::process::id(), now_epoch_s());
+    let probe_path = dir.join(probe_name);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe_path);
+            Ok(())
+        }
+        Err(err) => Err(AppError::InvalidArg(format!(
+            "root_dir is not writable for apply_llm_output (target: {rel_path}, root: {}). Mount the project volume as :rw. Underlying error: {err}",
+            root.display()
+        ))),
+    }
 }
 
 fn validate_files(files: &[ProjectFile]) -> AppResult<()> {
@@ -1353,6 +1471,7 @@ fn sign_payload(payload: &MappingPayload) -> AppResult<String> {
     data.hash(&mut hasher);
     payload.created_at_epoch_s.hash(&mut hasher);
     payload.expires_at_epoch_s.hash(&mut hasher);
+    serde_json::to_string(&payload.metadata)?.hash(&mut hasher);
     Ok(format!("{:x}", hasher.finish()))
 }
 

@@ -80,7 +80,7 @@ args = [
 1. Получить структуру проекта (`list_project_tree`) и выбрать нужные файлы.
 2. Обфусцировать вход (`obfuscate_project_from_paths` или `obfuscate_project`).
 3. Дать LLM только `obfuscated_files`.
-4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и (опционально) `mapping_payload`.
+4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и (опционально) `mapping_payload`. Можно передавать весь набор `obfuscated_files` или только изменённый subset файлов.
 5. MCP сам деобфусцирует и применяет файлы на диск.
 
 ## Контракты инструментов (кратко)
@@ -99,7 +99,7 @@ args = [
 
 ### `apply_llm_output`
 - Вход: `root_dir`, `llm_output_files`, `mapping_payload?`, `options?`.
-- MCP делает deobfuscation внутри сервера и пишет восстановленные файлы в `root_dir`.
+- MCP делает deobfuscation внутри сервера и пишет восстановленные файлы в `root_dir`. Поддерживается как полный набор файлов, так и subset изменённых файлов из исходного `obfuscated_files`.
 - Выход: `applied_files`, `stats`, `events`.
 - Приоритет mapping: `mapping_payload` из запроса, иначе server default mapping.
 
@@ -120,6 +120,15 @@ args = [
 - `MCP_LOG_MAX_FILES`
 - `MCP_LOG_STDOUT`
 - `MCP_ALLOW_DIRECT_DEOBFUSCATION` (default: `false`)
+
+## Типовые ошибки и восстановление
+
+- `fail-fast: obfuscated token ... is missing in LLM output for file ...`
+  - LLM повредил/удалил обфусцированный токен в возвращаемом файле. Повторите шаг правки, сохранив обфусцированные токены в этом файле.
+- `apply_llm_output received unknown file path ...`
+  - В `llm_output_files` передан путь, которого не было в исходном `obfuscated_files`. Возвращайте только исходные пути или их subset.
+- `root_dir is not writable for apply_llm_output ... Mount the project volume as :rw`
+  - Docker volume проекта смонтирован read-only. Для применения изменений используйте `:rw`.
 
 ## Разработка
 

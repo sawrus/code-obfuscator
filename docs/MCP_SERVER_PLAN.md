@@ -34,7 +34,7 @@ Input:
 
 Output:
 - `obfuscated_files`: list of `{ path, content }`
-- `mapping_payload`: opaque payload for reverse step (plain JSON by default)
+- `mapping_handle`: opaque handle for reverse step; mapping stays in MCP memory
 - `stats`: `{ file_count, mapping_entries, elapsed_ms }`
 
 Behavior:
@@ -45,7 +45,7 @@ Behavior:
 ### Tool 2: `deobfuscate_project`
 Input:
 - `llm_output_files`: list of `{ path, content }`
-- `mapping_payload` (optional; if missing, server may use default mapping)
+- `mapping_handle`
 - `options` (optional): `{ request_id }`
 
 Output:
@@ -53,10 +53,10 @@ Output:
 - `stats`: `{ file_count, restored_tokens, elapsed_ms }`
 
 Behavior:
-- Validates payload integrity/format.
-- Writes files + mapping to temp dirs.
-- Runs `code-obfuscator --mode reverse --source ... --target ... --mapping ...` without `--deep`.
-- Fail-fast if mapping is invalid or required obfuscated tokens are missing.
+ - Resolves mapping from the in-memory handle.
+ - Writes files to temp dirs.
+ - Runs `code-obfuscator --mode reverse --source ... --target ... --mapping ...` without `--deep`.
+ - Fail-fast if handle is invalid/expired or required obfuscated tokens are missing.
 
 ### Streaming layer
 Add optional stream events for long runs:

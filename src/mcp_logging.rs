@@ -114,7 +114,7 @@ impl McpLogger {
         );
         record.insert(
             "payload".into(),
-            event.payload.cloned().unwrap_or(Value::Null),
+            sanitize_payload(event.payload),
         );
 
         let line = Value::Object(record).to_string();
@@ -222,4 +222,88 @@ fn parse_bool(v: &str) -> bool {
 
 fn opt_json_str(v: Option<&str>) -> Value {
     v.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn sanitize_payload(payload: Option<&Value>) -> Value {
+    payload.map(sanitize_value).unwrap_or(Value::Null)
+}
+
+fn sanitize_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, inner) in map {
+                out.insert(key.clone(), sanitize_field(key, inner));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn sanitize_field(key: &str, value: &Value) -> Value {
+    match key {
+        "project_files" | "llm_output_files" | "obfuscated_files" | "restored_files" => {
+            summarize_file_array(value)
+        }
+        "mapping" | "mapping_payload" | "manual_mapping" => summarize_mapping(value),
+        "mapping_handle" => Value::String("<redacted>".into()),
+        "content" => Value::String("<redacted>".into()),
+        "text" => sanitize_text_field(value),
+        _ => sanitize_value(value),
+    }
+}
+
+fn summarize_file_array(value: &Value) -> Value {
+    let Some(items) = value.as_array() else {
+        return Value::String("<redacted>".into());
+    };
+    let paths = items
+        .iter()
+        .filter_map(|item| item.get("path").and_then(Value::as_str))
+        .map(Value::from)
+        .collect::<Vec<_>>();
+    json!({
+        "file_count": items.len(),
+        "paths": paths
+    })
+}
+
+fn summarize_mapping(value: &Value) -> Value {
+    json!({
+        "redacted": true,
+        "entry_count": count_mapping_entries(value)
+    })
+}
+
+fn count_mapping_entries(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            if let Some(mapping) = map.get("mapping") {
+                return count_mapping_entries(mapping);
+            }
+            if let Some(forward) = map.get("forward").and_then(Value::as_object) {
+                return forward.len();
+            }
+            if let Some(reverse) = map.get("reverse").and_then(Value::as_object) {
+                return reverse.len();
+            }
+            map.len()
+        }
+        _ => 0,
+    }
+}
+
+fn sanitize_text_field(value: &Value) -> Value {
+    let Some(text) = value.as_str() else {
+        return sanitize_value(value);
+    };
+
+    match serde_json::from_str::<Value>(text) {
+        Ok(parsed) => json!({
+            "embedded_json": sanitize_value(&parsed)
+        }),
+        Err(_) => Value::String(text.to_string()),
+    }
 }

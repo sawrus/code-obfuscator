@@ -80,7 +80,7 @@ args = [
 1. Получить структуру проекта (`list_project_tree`) и выбрать нужные файлы.
 2. Обфусцировать вход (`obfuscate_project_from_paths` или `obfuscate_project`).
 3. Дать LLM только `obfuscated_files`.
-4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и (опционально) `mapping_payload`. Можно передавать весь набор `obfuscated_files` или только изменённый subset файлов.
+4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и обязательным `mapping_handle`. Можно передавать весь набор `obfuscated_files` или только изменённый subset файлов.
 5. MCP сам деобфусцирует и применяет файлы на диск.
 
 ## Архитектура
@@ -106,10 +106,10 @@ sequenceDiagram
     IDE->>MCP: list_project_tree / obfuscate_project_from_paths
     MCP->>Project: Читает выбранные файлы
     Project-->>MCP: Исходные файлы
-    MCP-->>IDE: obfuscated_files + mapping_payload
+    MCP-->>IDE: obfuscated_files + mapping_handle
     IDE->>LLM: Передаёт только obfuscated_files
     LLM-->>IDE: Возвращает изменённые obfuscated_files
-    IDE->>MCP: apply_llm_output(root_dir, llm_output_files, mapping_payload)
+    IDE->>MCP: apply_llm_output(root_dir, llm_output_files, mapping_handle)
     MCP->>MCP: Деобфусцирует ответ LLM
     MCP->>Project: Применяет восстановленные файлы в root_dir
     MCP-->>IDE: applied_files
@@ -132,13 +132,13 @@ MCP-сервер изолирует работу с исходным кодом.
 
 ### `obfuscate_project`
 - Вход: `project_files`, `manual_mapping?`, `options?`.
-- Выход: `obfuscated_files`, `mapping_payload`, `stats`, `events`.
+- Выход: `obfuscated_files`, `mapping_handle`, `stats`, `events`.
 
 ### `apply_llm_output`
-- Вход: `root_dir`, `llm_output_files`, `mapping_payload?`, `options?`.
+- Вход: `root_dir`, `llm_output_files`, `mapping_handle`, `options?`.
 - MCP делает deobfuscation внутри сервера и пишет восстановленные файлы в `root_dir`. Поддерживается как полный набор файлов, так и subset изменённых файлов из исходного `obfuscated_files`.
 - Выход: `applied_files`, `stats`, `events`.
-- Приоритет mapping: `mapping_payload` из запроса, иначе server default mapping.
+- `mapping_handle` выдаётся предыдущим `obfuscate_*` вызовом и живёт только в памяти текущего процесса MCP.
 
 ## HTTP endpoints
 

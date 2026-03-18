@@ -138,6 +138,24 @@ fn read_log(dir: &Path) -> String {
     fs::read_to_string(dir.join("mcp-server.log")).expect("read mcp log")
 }
 
+fn parse_tool_payload(response: &Value) -> Value {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text payload");
+    serde_json::from_str(text).expect("tool payload json")
+}
+
+fn mapping_handle(payload: &Value) -> String {
+    assert!(
+        payload.get("mapping_payload").is_none(),
+        "legacy mapping_payload must not be present: {payload}"
+    );
+    payload["mapping_handle"]
+        .as_str()
+        .expect("mapping_handle")
+        .to_string()
+}
+
 #[test]
 fn mcp_roundtrip_obfuscate_then_deobfuscate() {
     let dir = tempdir().expect("tmp");
@@ -172,13 +190,9 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
     let obf_response = read_response(&mut stdout);
     assert!(obf_response.get("error").is_none(), "{obf_response}");
 
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-
+    let payload = parse_tool_payload(&obf_response);
     let obf_files = payload["obfuscated_files"].clone();
-    let mapping_payload = payload["mapping_payload"].clone();
+    let mapping_handle = mapping_handle(&payload);
 
     send_request(
         &mut stdin,
@@ -191,7 +205,7 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
                 "arguments":{
                     "root_dir": project.to_string_lossy().to_string(),
                     "llm_output_files": obf_files,
-                    "mapping_payload": mapping_payload
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -199,10 +213,7 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
     let rev_response = read_response(&mut stdout);
     assert!(rev_response.get("error").is_none(), "{rev_response}");
 
-    let rev_text = rev_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("rev text payload");
-    let restored: Value = serde_json::from_str(rev_text).expect("restored payload");
+    let restored = parse_tool_payload(&rev_response);
     let first_path = restored["applied_files"][0].as_str().expect("applied path");
 
     assert_eq!(first_path, "src/main.py", "{restored}");
@@ -251,11 +262,8 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
     let obf_response = read_response(&mut stdout);
     assert!(obf_response.get("error").is_none(), "{obf_response}");
 
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-    let mapping_payload = payload["mapping_payload"].clone();
+    let payload = parse_tool_payload(&obf_response);
+    let mapping_handle = mapping_handle(&payload);
     let query_file = payload["obfuscated_files"]
         .as_array()
         .expect("obfuscated files")
@@ -286,7 +294,7 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
                 "arguments":{
                     "root_dir": project.to_string_lossy().to_string(),
                     "llm_output_files": [query_file],
-                    "mapping_payload": mapping_payload
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -294,10 +302,7 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
     let apply_response = read_response(&mut stdout);
     assert!(apply_response.get("error").is_none(), "{apply_response}");
 
-    let apply_text = apply_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("apply text payload");
-    let applied: Value = serde_json::from_str(apply_text).expect("applied payload");
+    let applied = parse_tool_payload(&apply_response);
     assert_eq!(
         applied["applied_files"],
         json!(["app/query.py"]),
@@ -318,6 +323,8 @@ fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
 #[test]
 fn mcp_apply_llm_output_rejects_unknown_subset_paths() {
     let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).expect("mkdirs");
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_LOG_STDOUT", "false")
@@ -336,21 +343,31 @@ fn mcp_apply_llm_output_rejects_unknown_subset_paths() {
             "id":5,
             "method":"tools/call",
             "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"app/query.py","content":"select * from bs.users\n"}],
+                    "manual_mapping":{"bs":"mmm"}
+                }
+            }
+        }),
+    );
+
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+    let mapping_handle = mapping_handle(&parse_tool_payload(&obf_response));
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":6,
+            "method":"tools/call",
+            "params":{
                 "name":"apply_llm_output",
                 "arguments":{
-                    "root_dir": dir.path().to_string_lossy().to_string(),
+                    "root_dir": project.to_string_lossy().to_string(),
                     "llm_output_files":[{"path":"other.py","content":"print('x')"}],
-                    "mapping_payload":{
-                        "mapping":{
-                            "forward":{"bs":"mmm"},
-                            "reverse":{"mmm":"bs"}
-                        },
-                        "created_at_epoch_s": 1,
-                        "metadata":{
-                            "original_paths":["app/query.py"],
-                            "file_tokens":{"app/query.py":["mmm"]}
-                        }
-                    }
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -398,11 +415,8 @@ fn mcp_apply_llm_output_fails_when_returned_file_loses_required_token() {
     let obf_response = read_response(&mut stdout);
     assert!(obf_response.get("error").is_none(), "{obf_response}");
 
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-    let mapping_payload = payload["mapping_payload"].clone();
+    let payload = parse_tool_payload(&obf_response);
+    let mapping_handle = mapping_handle(&payload);
 
     send_request(
         &mut stdin,
@@ -415,7 +429,7 @@ fn mcp_apply_llm_output_fails_when_returned_file_loses_required_token() {
                 "arguments":{
                     "root_dir": project.to_string_lossy().to_string(),
                     "llm_output_files":[{"path":"app/query.py","content":"select * from users\n"}],
-                    "mapping_payload": mapping_payload
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -677,14 +691,12 @@ fn mcp_uses_default_mapping_when_manual_not_provided() {
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let payload = parse_tool_payload(&response);
     let obf_content = payload["obfuscated_files"][0]["content"]
         .as_str()
         .expect("content");
     assert!(obf_content.contains("x_run"), "{payload}");
+    let _ = mapping_handle(&payload);
 
     drop(stdin);
     let _ = child.wait();
@@ -720,15 +732,13 @@ fn mcp_obfuscate_enrich_detected_terms_opt_in() {
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
+    let payload = parse_tool_payload(&response);
+    let obf_content = payload["obfuscated_files"][0]["content"]
         .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let forward = payload["mapping_payload"]["mapping"]["forward"]
-        .as_object()
-        .expect("forward map");
-    assert!(!forward.is_empty(), "{payload}");
-    assert!(forward.contains_key("users"), "{payload}");
+        .expect("content");
+    assert_ne!(obf_content, "select 1 from users where id = 1", "{payload}");
+    assert!(!obf_content.contains("users"), "{payload}");
+    let _ = mapping_handle(&payload);
 
     drop(stdin);
     let _ = child.wait();
@@ -826,14 +836,12 @@ fn mcp_obfuscate_project_from_paths_reads_files_in_mcp() {
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let payload = parse_tool_payload(&response);
     let content = payload["obfuscated_files"][0]["content"]
         .as_str()
         .expect("content");
     assert!(content.contains("select 1 from mmm.users"), "{payload}");
+    let _ = mapping_handle(&payload);
 
     drop(stdin);
     let _ = child.wait();
@@ -846,7 +854,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     fs::create_dir_all(project.join("app")).expect("mkdirs");
     fs::write(
         project.join("app/query.py"),
-        "QUERY_1 = \"\"\"\nselect 1 from mmm.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
+        "QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
     )
     .expect("write file");
 
@@ -868,17 +876,37 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
             "id":42,
             "method":"tools/call",
             "params":{
+                "name":"obfuscate_project_from_paths",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "file_paths":["app/query.py"],
+                    "manual_mapping":{"bs":"mmm"}
+                }
+            }
+        }),
+    );
+
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+    let obf_payload = parse_tool_payload(&obf_response);
+    let mapping_handle = mapping_handle(&obf_payload);
+    let obfuscated_content = obf_payload["obfuscated_files"][0]["content"]
+        .as_str()
+        .expect("obfuscated content");
+    fs::write(project.join("app/query.py"), obfuscated_content).expect("write obfuscated file");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":43,
+            "method":"tools/call",
+            "params":{
                 "name":"deobfuscate_project_from_paths",
                 "arguments":{
                     "root_dir": project.to_string_lossy().to_string(),
                     "file_paths":["app/query.py"],
-                    "mapping_payload":{
-                        "mapping":{
-                            "forward":{"bs":"mmm"},
-                            "reverse":{"mmm":"bs"}
-                        },
-                        "created_at_epoch_s": 1
-                    }
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -886,10 +914,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let payload = parse_tool_payload(&response);
     let content = payload["restored_files"][0]["content"]
         .as_str()
         .expect("content");
@@ -1032,28 +1057,21 @@ fn mcp_http_jsonrpc_over_root_and_mcp_path() {
     let (tool_status, tool_json) = http_status_and_json(&tool_resp);
     assert_eq!(tool_status, 200, "{tool_resp}");
 
-    let text = tool_json["result"]["content"][0]["text"]
-        .as_str()
-        .expect("tool result text");
-    let payload: Value = serde_json::from_str(text).expect("tool payload");
+    let payload = parse_tool_payload(&tool_json);
     let content = payload["obfuscated_files"][0]["content"]
         .as_str()
         .expect("obfuscated content");
     assert!(content.contains("select 1 from mmm.users"), "{payload}");
     assert!(!content.contains("py_var_"), "{payload}");
+    let _ = mapping_handle(&payload);
 
     kill_and_wait(&mut child);
 }
 
 #[test]
-fn mcp_deobfuscate_uses_default_mapping_when_payload_missing() {
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
-
+fn mcp_deobfuscate_project_uses_mapping_handle() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1070,9 +1088,31 @@ fn mcp_deobfuscate_uses_default_mapping_when_payload_missing() {
             "id":11,
             "method":"tools/call",
             "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
+                    "manual_mapping":{"run_order":"x_run"}
+                }
+            }
+        }),
+    );
+
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+    let obf_payload = parse_tool_payload(&obf_response);
+    let mapping_handle = mapping_handle(&obf_payload);
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":12,
+            "method":"tools/call",
+            "params":{
                 "name":"deobfuscate_project",
                 "arguments":{
-                    "llm_output_files":[{"path":"a.py","content":"def x_run(order_id):\n    return order_id\n"}]
+                    "llm_output_files":[{"path":"a.py","content":"def x_run(order_id):\n    return order_id\n"}],
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -1080,10 +1120,7 @@ fn mcp_deobfuscate_uses_default_mapping_when_payload_missing() {
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
+    let payload = parse_tool_payload(&response);
     let restored = payload["restored_files"][0]["content"]
         .as_str()
         .expect("restored content");
@@ -1113,16 +1150,31 @@ fn mcp_deobfuscate_fails_fast_on_missing_tokens() {
             "id":10,
             "method":"tools/call",
             "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
+                    "manual_mapping":{"run_order":"x_run"}
+                }
+            }
+        }),
+    );
+
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+    let obf_payload = parse_tool_payload(&obf_response);
+    let mapping_handle = mapping_handle(&obf_payload);
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":13,
+            "method":"tools/call",
+            "params":{
                 "name":"deobfuscate_project",
                 "arguments":{
                     "llm_output_files":[{"path":"a.py","content":"print('nothing')"}],
-                    "mapping_payload":{
-                        "mapping":{
-                            "forward":{"run_order":"x_run"},
-                            "reverse":{"x_run":"run_order"}
-                        },
-                        "created_at_epoch_s": 1
-                    }
+                    "mapping_handle": mapping_handle
                 }
             }
         }),
@@ -1134,6 +1186,186 @@ fn mcp_deobfuscate_fails_fast_on_missing_tokens() {
 
     drop(stdin);
     let _ = child.wait();
+}
+
+#[test]
+fn mcp_apply_llm_output_rejects_invalid_mapping_handle() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).expect("mkdirs");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":14,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "llm_output_files":[{"path":"a.py","content":"print('x')"}],
+                    "mapping_handle":"mh-does-not-exist"
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    let error_text = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error_text.contains("invalid or expired mapping_handle"), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_apply_llm_output_rejects_expired_mapping_handle() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).expect("mkdirs");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":15,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"a.py","content":"select * from bs.users"}],
+                    "manual_mapping":{"bs":"mmm"},
+                    "options":{"security":{"ttl_seconds":0}}
+                }
+            }
+        }),
+    );
+
+    let obf_response = read_response(&mut stdout);
+    assert!(obf_response.get("error").is_none(), "{obf_response}");
+    let payload = parse_tool_payload(&obf_response);
+    let handle = mapping_handle(&payload);
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":16,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "llm_output_files": payload["obfuscated_files"].clone(),
+                    "mapping_handle": handle
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    let error_text = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error_text.contains("invalid or expired mapping_handle"), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_mapping_handle_does_not_survive_restart() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).expect("mkdirs");
+
+    let mut first_child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn first server");
+
+    let mut first_stdin = first_child.stdin.take().expect("stdin");
+    let mut first_stdout = first_child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut first_stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":17,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"a.py","content":"select * from bs.users"}],
+                    "manual_mapping":{"bs":"mmm"}
+                }
+            }
+        }),
+    );
+
+    let first_response = read_response(&mut first_stdout);
+    assert!(first_response.get("error").is_none(), "{first_response}");
+    let payload = parse_tool_payload(&first_response);
+    let handle = mapping_handle(&payload);
+    let obf_files = payload["obfuscated_files"].clone();
+
+    drop(first_stdin);
+    let _ = first_child.wait();
+
+    let mut second_child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn second server");
+
+    let mut second_stdin = second_child.stdin.take().expect("stdin");
+    let mut second_stdout = second_child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut second_stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":18,
+            "method":"tools/call",
+            "params":{
+                "name":"apply_llm_output",
+                "arguments":{
+                    "root_dir": project.to_string_lossy().to_string(),
+                    "llm_output_files": obf_files,
+                    "mapping_handle": handle
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut second_stdout);
+    let error_text = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error_text.contains("invalid or expired mapping_handle"), "{response}");
+
+    drop(second_stdin);
+    let _ = second_child.wait();
 }
 
 #[test]
@@ -1154,7 +1386,18 @@ fn mcp_logs_stdio_requests_and_responses() {
 
     send_request(
         &mut stdin,
-        &json!({"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}),
+        &json!({
+            "jsonrpc":"2.0",
+            "id":101,
+            "method":"tools/call",
+            "params":{
+                "name":"obfuscate_project",
+                "arguments":{
+                    "project_files":[{"path":"secret.sql","content":"select * from mostbet.users"}],
+                    "manual_mapping":{"mostbet":"mmm_secret"}
+                }
+            }
+        }),
     );
     let _ = read_response(&mut stdout);
 
@@ -1165,6 +1408,10 @@ fn mcp_logs_stdio_requests_and_responses() {
     assert!(log.contains("\"transport\":\"stdio\""), "{log}");
     assert!(log.contains("\"direction\":\"request\""), "{log}");
     assert!(log.contains("\"direction\":\"response\""), "{log}");
+    assert!(log.contains("\"file_count\":1"), "{log}");
+    assert!(log.contains("secret.sql"), "{log}");
+    assert!(!log.contains("mostbet.users"), "{log}");
+    assert!(!log.contains("mmm_secret"), "{log}");
 }
 
 #[test]
@@ -1190,17 +1437,31 @@ fn mcp_logs_http_requests_and_responses() {
     let (health_status, _) = http_status_and_json(&health_resp);
     assert_eq!(health_status, 200, "{health_resp}");
 
-    let init_body = json!({"jsonrpc":"2.0","id":201,"method":"initialize","params":{}});
-    let init_resp = http_request(&addr, "POST", "/mcp", Some(&init_body.to_string()));
-    let (init_status, _) = http_status_and_json(&init_resp);
-    assert_eq!(init_status, 200, "{init_resp}");
+    let tool_body = json!({
+        "jsonrpc":"2.0",
+        "id":201,
+        "method":"tools/call",
+        "params":{
+            "name":"obfuscate_project",
+            "arguments":{
+                "project_files":[{"path":"secret.sql","content":"select * from private_schema.users"}],
+                "manual_mapping":{"private_schema":"mmm_http"}
+            }
+        }
+    });
+    let tool_resp = http_request(&addr, "POST", "/mcp", Some(&tool_body.to_string()));
+    let (tool_status, _) = http_status_and_json(&tool_resp);
+    assert_eq!(tool_status, 200, "{tool_resp}");
 
     kill_and_wait(&mut child);
 
     let log = read_log(&log_dir);
     assert!(log.contains("\"transport\":\"http-admin\""), "{log}");
     assert!(log.contains("\"transport\":\"http-mcp\""), "{log}");
-    assert!(log.contains("\"method\":\"initialize\""), "{log}");
+    assert!(log.contains("\"method\":\"tools/call\""), "{log}");
+    assert!(log.contains("secret.sql"), "{log}");
+    assert!(!log.contains("private_schema.users"), "{log}");
+    assert!(!log.contains("mmm_http"), "{log}");
 }
 
 #[test]

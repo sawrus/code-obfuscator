@@ -11,7 +11,7 @@
 
 Порядок:
 1) Сначала вызови `tools/list` и проверь, что инструменты доступны.
-2) Используй `root_dir="/workspace/projects/ai/codex/code-obfuscator/test"`.
+2) Используй `root_dir="/workspace/projects/test"`.
 3) Вызови `list_project_tree(root_dir=...)` и выбери релевантные файлы.
 4) Вызови `obfuscate_project_from_paths(root_dir=..., file_paths=[...])`.
 5) Выполни изменения только по `obfuscated_files`.

@@ -83,6 +83,43 @@ args = [
 4. Передать результат LLM в `apply_llm_output` с `root_dir`, `llm_output_files` и (опционально) `mapping_payload`. Можно передавать весь набор `obfuscated_files` или только изменённый subset файлов.
 5. MCP сам деобфусцирует и применяет файлы на диск.
 
+## Архитектура
+
+```mermaid
+flowchart LR
+    user["Пользователь"] --> ide["Agent IDE<br/>например, Codex"]
+    ide --> llm["LLM"]
+    ide --> mcp["MCP server<br/>code-obfuscator"]
+    mcp --> project["Проект / файлы на диске"]
+    mcp -. "obfuscated_files / llm_output_files" .- llm
+```
+
+```mermaid
+sequenceDiagram
+    actor User as Пользователь
+    participant IDE as Agent IDE (Codex)
+    participant MCP as MCP server
+    participant LLM as LLM
+    participant Project as Проект / root_dir
+
+    User->>IDE: Просит изменить код
+    IDE->>MCP: list_project_tree / obfuscate_project_from_paths
+    MCP->>Project: Читает выбранные файлы
+    Project-->>MCP: Исходные файлы
+    MCP-->>IDE: obfuscated_files + mapping_payload
+    IDE->>LLM: Передаёт только obfuscated_files
+    LLM-->>IDE: Возвращает изменённые obfuscated_files
+    IDE->>MCP: apply_llm_output(root_dir, llm_output_files, mapping_payload)
+    MCP->>MCP: Деобфусцирует ответ LLM
+    MCP->>Project: Применяет восстановленные файлы в root_dir
+    MCP-->>IDE: applied_files
+    IDE-->>User: Показывает результат
+```
+
+Agent IDE выступает оркестратором: принимает запрос пользователя, вызывает MCP-инструменты, передаёт в модель только `obfuscated_files` и затем отправляет результат обратно в `apply_llm_output`.
+
+MCP-сервер изолирует работу с исходным кодом. Он читает файлы проекта, обфусцирует содержимое перед отправкой в LLM, а после ответа модели сам выполняет deobfuscation и запись восстановленных файлов в `root_dir`.
+
 ## Контракты инструментов (кратко)
 
 ### `list_project_tree`

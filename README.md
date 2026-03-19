@@ -186,3 +186,7 @@ make e2e-blackbox
 3. Перезаписывает `$HOME/projects/test/query.py` входным fixture.
 4. Запускает `codex exec` с prompt из `test/prompt.txt`.
 5. Проверяет, что финальный блок совпадает с ожидаемым multiline-выводом для `mmm.users` и `%(mmm_user_ids)s`.
+
+## Prompt templates
+
+Готовые general-шаблоны промптов (RU/EN, short/long) находятся в `test/prompt_general.md`.

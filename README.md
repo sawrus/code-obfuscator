@@ -46,6 +46,150 @@ curl -i http://127.0.0.1:18787/health
 curl -i http://127.0.0.1:18787/mapping
 ```
 
+## Подключение MCP в разные Agent IDE
+
+Ниже — один канонический шаблон запуска через Docker, синхронизированный с `test/mcp_configure.sh`. Во всех примерах отличается только формат конфигурации IDE, а не сам запуск контейнера.
+
+### Канонический docker-template
+
+**Transport:** `stdio`
+
+```bash
+docker run --rm -i \
+  -e MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json \
+  -e MCP_LOG_STDOUT=false \
+  -v /ABS/PATH/mapping.default.json:/data/mapping.default.json:ro \
+  -v /ABS/PATH/projects:/workspace/projects:rw \
+  code-obfuscator-mcp:local
+```
+
+Что важно для всех IDE:
+- Смонтируйте mapping-файл: `/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro`.
+- Смонтируйте каталог с проектами: `/ABS/PATH/projects:/workspace/projects:rw`.
+- `root_dir` в MCP-вызовах должен быть путём **внутри контейнера**, например `/workspace/projects/my-project`, а не путём хоста вида `/Users/...` или `/home/...`.
+- Если планируете использовать `apply_llm_output`, проект обязательно должен быть смонтирован как `:rw`, иначе MCP не сможет записать изменения обратно на диск.
+
+### Codex
+
+**Transport:** `stdio`
+
+Формат вставки в `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.code_obfuscator]
+enabled = true
+command = "docker"
+args = [
+  "run", "--rm", "-i",
+  "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
+  "-e", "MCP_LOG_STDOUT=false",
+  "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
+  "-v", "/ABS/PATH/projects:/workspace/projects:rw",
+  "code-obfuscator-mcp:local"
+]
+```
+
+Volumes:
+- mapping: `:ro`
+- projects: `:rw`
+
+`root_dir` должен указывать на путь внутри контейнера, например `/workspace/projects/my-project`.
+Для `apply_llm_output` mount с проектом должен оставаться `:rw`.
+
+### Cursor
+
+**Transport:** `stdio`
+
+Формат вставки в `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "code_obfuscator": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
+        "-e", "MCP_LOG_STDOUT=false",
+        "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
+        "-v", "/ABS/PATH/projects:/workspace/projects:rw",
+        "code-obfuscator-mcp:local"
+      ]
+    }
+  }
+}
+```
+
+Volumes:
+- mapping: `:ro`
+- projects: `:rw`
+
+`root_dir` должен указывать на путь внутри контейнера, например `/workspace/projects/my-project`.
+Для `apply_llm_output` mount с проектом должен оставаться `:rw`.
+
+### Claude Code
+
+**Transport:** `stdio`
+
+Формат вставки в `.mcp.json` или добавления через `claude mcp add-json`:
+
+```json
+{
+  "mcpServers": {
+    "code_obfuscator": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
+        "-e", "MCP_LOG_STDOUT=false",
+        "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
+        "-v", "/ABS/PATH/projects:/workspace/projects:rw",
+        "code-obfuscator-mcp:local"
+      ]
+    }
+  }
+}
+```
+
+Volumes:
+- mapping: `:ro`
+- projects: `:rw`
+
+`root_dir` должен указывать на путь внутри контейнера, например `/workspace/projects/my-project`.
+Для `apply_llm_output` mount с проектом должен оставаться `:rw`.
+
+### VS Code / GitHub Copilot Agent Mode
+
+**Transport:** `stdio`
+
+Формат вставки в `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "code_obfuscator": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
+        "-e", "MCP_LOG_STDOUT=false",
+        "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
+        "-v", "/ABS/PATH/projects:/workspace/projects:rw",
+        "code-obfuscator-mcp:local"
+      ]
+    }
+  }
+}
+```
+
+Volumes:
+- mapping: `:ro`
+- projects: `:rw`
+
+`root_dir` должен указывать на путь внутри контейнера, например `/workspace/projects/my-project`.
+Для `apply_llm_output` mount с проектом должен оставаться `:rw`.
+
 ## Подключение в Codex
 
 ### Вариант 1: HTTP
@@ -58,22 +202,8 @@ url = "http://127.0.0.1:18787"
 
 ### Вариант 2: stdio + docker
 
-Важно: если используете `apply_llm_output`, проект должен быть смонтирован как `:rw`.
-Для path-based инструментов (`list_project_tree`, `obfuscate_project_from_paths`, `apply_llm_output`) `root_dir` должен быть путём внутри контейнера (например, `/workspace/project`).
-
-```toml
-[mcp_servers.code_obfuscator]
-enabled = true
-command = "docker"
-args = [
-  "run", "--rm", "-i",
-  "-e", "MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json",
-  "-e", "MCP_LOG_STDOUT=false",
-  "-v", "/ABS/PATH/mapping.default.json:/data/mapping.default.json:ro",
-  "-v", "/ABS/PATH/PROJECT_ROOT:/workspace/project:rw",
-  "code-obfuscator-mcp:local"
-]
-```
+Используйте общий канонический шаблон из секции ["Подключение MCP в разные Agent IDE"](#подключение-mcp-в-разные-agent-ide) и адаптируйте только формат вставки под `~/.codex/config.toml`.
+Готовый пример для Codex приведён в одноимённой подсекции выше.
 
 ## Рекомендуемый workflow с LLM
 

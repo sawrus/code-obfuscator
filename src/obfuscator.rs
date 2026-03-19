@@ -19,11 +19,45 @@ pub fn transform_files_global(
 fn apply_global_mapping(text: &str, map: &BTreeMap<String, String>) -> String {
     let mut out = text.to_string();
     for (from, to) in map {
-        let pattern = format!(r"\b{}\b", regex::escape(from));
-        let re = Regex::new(&pattern).expect("valid regex");
-        out = re.replace_all(&out, to.as_str()).into_owned();
+        out = replace_global_token(&out, from, to);
     }
     out
+}
+
+fn replace_global_token(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        if rest.starts_with(from) && has_global_boundary(text, i, from.len()) {
+            out.push_str(to);
+            i += from.len();
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("char");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn has_global_boundary(text: &str, start: usize, len: usize) -> bool {
+    let before_ok = text[..start]
+        .chars()
+        .next_back()
+        .map(|c| !c.is_alphanumeric())
+        .unwrap_or(true);
+    let after_ok = text[start + len..]
+        .chars()
+        .next()
+        .map(|c| !c.is_alphanumeric())
+        .unwrap_or(true);
+    before_ok && after_ok
 }
 
 pub fn transform_files(
@@ -1152,6 +1186,30 @@ mod tests {
         }];
         let out = transform_files_global(&f, &map).expect("transform");
         assert_eq!(out[0].1, "# Launch\nprint(\"Launch\")\nLaunch()");
+    }
+
+    #[test]
+    fn global_mode_replaces_inside_snake_case_but_not_larger_alnum_tokens() {
+        let map = BTreeMap::from([("mostbet".to_string(), "mmm".to_string())]);
+        let f = vec![FileEntry {
+            rel: "a.sql".into(),
+            text: "mostbet.users %(mostbet_user_ids)s xmostbet9".into(),
+        }];
+
+        let out = transform_files_global(&f, &map).expect("transform");
+        assert_eq!(out[0].1, "mmm.users %(mmm_user_ids)s xmostbet9");
+    }
+
+    #[test]
+    fn global_mode_does_not_replace_inside_larger_alnum_token() {
+        let map = BTreeMap::from([("mostbet".to_string(), "mmm".to_string())]);
+        let f = vec![FileEntry {
+            rel: "a.txt".into(),
+            text: "xmostbet9".into(),
+        }];
+
+        let out = transform_files_global(&f, &map).expect("transform");
+        assert_eq!(out[0].1, "xmostbet9");
     }
 
     #[test]

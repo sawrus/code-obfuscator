@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-03-19
+
+### Added
+- New on-demand blackbox flow in Makefile: `make e2e-blackbox` builds fresh MCP Docker image, reconfigures Codex MCP, runs `codex exec`, and validates the exact `query.py` output block.
+- New MCP/integration regression coverage for request-id mapping flow, strict unknown-field rejection (including `message_payload`), and path-based SQL/Python identifier replacement.
+
+### Changed
+- MCP API moved to server-side mapping by `options.request_id`: client-side mapping inputs (`manual_mapping`, `mapping_payload`) were removed from active tool contracts.
+- `obfuscate_project`/`obfuscate_project_from_paths` now persist request mapping in MCP memory; `apply_llm_output`/`deobfuscate_*` resolve mapping only by `request_id`.
+- Global obfuscation boundary logic now replaces mapped terms inside snake_case fragments (e.g. `mostbet_user_ids -> mmm_user_ids`) while still avoiding replacements inside larger alphanumeric tokens.
+- README and test prompt/docs were updated to the request-id workflow and blackbox validation steps.
+- Package version bumped to `0.5.0`.
+
 ## [0.4.0] - 2026-02-27
 
 ### Added

@@ -37,10 +37,13 @@ const DEFAULT_TREE_MAX_DEPTH: usize = 6;
 const DEFAULT_TREE_MAX_ENTRIES: usize = 1_000;
 const MAX_TREE_MAX_DEPTH: usize = 32;
 const MAX_TREE_MAX_ENTRIES: usize = 20_000;
+const REQUEST_MAPPING_TTL_SECONDS: u64 = 24 * 60 * 60;
+const REQUEST_MAPPING_MAX_ENTRIES: usize = 256;
 
 #[derive(Clone)]
 struct AppState {
     default_mapping: MappingStore,
+    request_mappings: RequestMappingStore,
     logger: McpLogger,
     allow_direct_deobfuscation: bool,
 }
@@ -49,6 +52,19 @@ struct AppState {
 struct MappingStore {
     inner: Arc<RwLock<BTreeMap<String, String>>>,
     path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct RequestMappingStore {
+    inner: Arc<RwLock<BTreeMap<String, StoredRequestMapping>>>,
+    ttl_seconds: u64,
+    max_entries: usize,
+}
+
+#[derive(Clone)]
+struct StoredRequestMapping {
+    stored_at_epoch_s: u64,
+    mapping: MappingPayload,
 }
 
 impl MappingStore {
@@ -84,6 +100,79 @@ impl MappingStore {
     }
 }
 
+impl RequestMappingStore {
+    fn new(ttl_seconds: u64, max_entries: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            ttl_seconds,
+            max_entries,
+        }
+    }
+
+    fn insert(&self, request_id: String, mapping: MappingPayload) -> AppResult<()> {
+        let now = now_epoch_s();
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| AppError::InvalidArg("request mapping store lock poisoned".into()))?;
+        self.cleanup_locked(&mut guard, now);
+        guard.insert(
+            request_id,
+            StoredRequestMapping {
+                stored_at_epoch_s: now,
+                mapping,
+            },
+        );
+        self.enforce_max_entries(&mut guard);
+        Ok(())
+    }
+
+    fn resolve(&self, request_id: &str) -> AppResult<MappingPayload> {
+        let now = now_epoch_s();
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| AppError::InvalidArg("request mapping store lock poisoned".into()))?;
+        self.cleanup_locked(&mut guard, now);
+        guard
+            .get(request_id)
+            .cloned()
+            .map(|stored| stored.mapping)
+            .ok_or_else(|| {
+                AppError::InvalidArg(format!("unknown request_id: {request_id}"))
+            })
+    }
+
+    fn cleanup_locked(&self, guard: &mut BTreeMap<String, StoredRequestMapping>, now: u64) {
+        if self.ttl_seconds > 0 {
+            guard.retain(|_, stored| {
+                now.saturating_sub(stored.stored_at_epoch_s) <= self.ttl_seconds
+            });
+        }
+        self.enforce_max_entries(guard);
+    }
+
+    fn enforce_max_entries(&self, guard: &mut BTreeMap<String, StoredRequestMapping>) {
+        if self.max_entries == 0 {
+            guard.clear();
+            return;
+        }
+
+        while guard.len() > self.max_entries {
+            let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(request_id, stored)| {
+                    (stored.stored_at_epoch_s, (*request_id).clone())
+                })
+                .map(|(request_id, _)| request_id.clone())
+            else {
+                break;
+            };
+            guard.remove(&oldest_key);
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
     id: Option<Value>,
@@ -116,59 +205,59 @@ struct ToolCallParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectFile {
     path: String,
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObfuscateArgs {
     project_files: Vec<ProjectFile>,
-    #[serde(default)]
-    manual_mapping: BTreeMap<String, String>,
     #[serde(default)]
     options: ToolOptions,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObfuscateFromPathsArgs {
     root_dir: String,
     #[serde(default)]
     file_paths: Vec<String>,
     #[serde(default)]
-    manual_mapping: BTreeMap<String, String>,
-    #[serde(default)]
     options: ToolOptions,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeobfuscateArgs {
     llm_output_files: Vec<ProjectFile>,
-    mapping_payload: Option<MappingPayload>,
     #[serde(default)]
     options: ToolOptions,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeobfuscateFromPathsArgs {
     root_dir: String,
     #[serde(default)]
     file_paths: Vec<String>,
-    mapping_payload: Option<MappingPayload>,
     #[serde(default)]
     options: ToolOptions,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApplyLlmOutputArgs {
     root_dir: String,
     llm_output_files: Vec<ProjectFile>,
-    mapping_payload: Option<MappingPayload>,
     #[serde(default)]
     options: ToolOptions,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListProjectTreeArgs {
     root_dir: String,
     max_depth: Option<usize>,
@@ -177,6 +266,7 @@ struct ListProjectTreeArgs {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolOptions {
     request_id: Option<String>,
     stream: Option<bool>,
@@ -185,6 +275,7 @@ struct ToolOptions {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SecurityOptions {
     sign_mapping: Option<bool>,
     ttl_seconds: Option<u64>,
@@ -214,7 +305,6 @@ struct MappingMetadata {
 struct ObfuscateResult {
     request_id: String,
     obfuscated_files: Vec<ProjectFile>,
-    mapping_payload: MappingPayload,
     stats: Stats,
     events: Vec<StageEvent>,
 }
@@ -274,6 +364,10 @@ fn run() -> AppResult<()> {
         parse_env_bool("MCP_ALLOW_DIRECT_DEOBFUSCATION").unwrap_or(false);
     let state = AppState {
         default_mapping: MappingStore::new(mapping_path),
+        request_mappings: RequestMappingStore::new(
+            REQUEST_MAPPING_TTL_SECONDS,
+            REQUEST_MAPPING_MAX_ENTRIES,
+        ),
         logger,
         allow_direct_deobfuscation,
     };
@@ -823,13 +917,13 @@ fn negotiate_protocol_version(params: &Value) -> String {
 fn tools_definitions(allow_direct_deobfuscation: bool) -> Vec<Value> {
     let mut tools = vec![
         json!({"name":"list_project_tree","description":"List directory structure for a project root. Reads only metadata (paths/types), not file contents.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"max_depth":{"type":"integer","minimum":1},"max_entries":{"type":"integer","minimum":1},"include_hidden":{"type":"boolean"}}}}),
-        json!({"name":"obfuscate_project_from_paths","description":"Read project files from disk inside MCP by root_dir + file_paths and obfuscate them before sending to LLM.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
-        json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses global mapping mode (no --deep).","inputSchema":{"type":"object","required":["project_files"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"manual_mapping":{"type":"object","additionalProperties":{"type":"string"}},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
-        json!({"name":"apply_llm_output","description":"Accept LLM-produced obfuscated files, deobfuscate inside MCP, and write restored files to root_dir. Supports applying either the full obfuscated file set or only a changed subset. Returns only applied paths and metadata.","inputSchema":{"type":"object","required":["root_dir","llm_output_files"],"properties":{"root_dir":{"type":"string"},"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
+        json!({"name":"obfuscate_project_from_paths","description":"Read project files from disk inside MCP by root_dir + file_paths and obfuscate them before sending to LLM. Stores the mapping under options.request_id for later deobfuscation.","inputSchema":{"type":"object","required":["root_dir","options"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"options":{"type":"object","required":["request_id"],"properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
+        json!({"name":"obfuscate_project","description":"Obfuscate text-only project files before sending to an LLM. Uses server-side default mapping mode and stores the result under options.request_id.","inputSchema":{"type":"object","required":["project_files","options"],"properties":{"project_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"options":{"type":"object","required":["request_id"],"properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"},"enrich_detected_terms":{"type":"boolean"}}}}}}),
+        json!({"name":"apply_llm_output","description":"Accept LLM-produced obfuscated files, resolve the request mapping from options.request_id, deobfuscate inside MCP, and write restored files to root_dir. Supports applying either the full obfuscated file set or only a changed subset. Returns only applied paths and metadata.","inputSchema":{"type":"object","required":["root_dir","llm_output_files","options"],"properties":{"root_dir":{"type":"string"},"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"options":{"type":"object","required":["request_id"],"properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}),
     ];
     if allow_direct_deobfuscation {
-        tools.push(json!({"name":"deobfuscate_project_from_paths","description":"Read obfuscated files from disk inside MCP by root_dir + file_paths and deobfuscate them.","inputSchema":{"type":"object","required":["root_dir"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
-        tools.push(json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response. Uses provided mapping_payload or falls back to server default mapping.","inputSchema":{"type":"object","required":["llm_output_files"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"mapping_payload":{"type":"object"},"options":{"type":"object","properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
+        tools.push(json!({"name":"deobfuscate_project_from_paths","description":"Read obfuscated files from disk inside MCP by root_dir + file_paths and deobfuscate them using the stored request mapping.","inputSchema":{"type":"object","required":["root_dir","options"],"properties":{"root_dir":{"type":"string"},"file_paths":{"type":"array","items":{"type":"string"}},"options":{"type":"object","required":["request_id"],"properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
+        tools.push(json!({"name":"deobfuscate_project","description":"Restore obfuscated files after LLM response using the stored request mapping referenced by options.request_id.","inputSchema":{"type":"object","required":["llm_output_files","options"],"properties":{"llm_output_files":{"type":"array","items":{"type":"object","required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}},"options":{"type":"object","required":["request_id"],"properties":{"request_id":{"type":"string"},"stream":{"type":"boolean"}}}}}}));
     }
     tools
 }
@@ -945,7 +1039,6 @@ fn obfuscate_project_from_paths(
     obfuscate_project(
         ObfuscateArgs {
             project_files,
-            manual_mapping: args.manual_mapping,
             options: args.options,
         },
         state,
@@ -960,7 +1053,6 @@ fn deobfuscate_project_from_paths(
     deobfuscate_project(
         DeobfuscateArgs {
             llm_output_files,
-            mapping_payload: args.mapping_payload,
             options: args.options,
         },
         state,
@@ -968,11 +1060,11 @@ fn deobfuscate_project_from_paths(
 }
 
 fn apply_llm_output(args: ApplyLlmOutputArgs, state: &AppState) -> AppResult<ApplyLlmOutputResult> {
+    let request_id = require_request_id(&args.options)?;
     let root = resolve_root_dir(&args.root_dir)?;
     let deobfuscated = deobfuscate_project(
         DeobfuscateArgs {
             llm_output_files: args.llm_output_files,
-            mapping_payload: args.mapping_payload,
             options: args.options,
         },
         state,
@@ -991,7 +1083,7 @@ fn apply_llm_output(args: ApplyLlmOutputArgs, state: &AppState) -> AppResult<App
         .map(|f| f.path.clone())
         .collect();
     Ok(ApplyLlmOutputResult {
-        request_id: deobfuscated.request_id,
+        request_id,
         applied_files,
         stats: deobfuscated.stats,
         events,
@@ -1127,21 +1219,14 @@ fn is_hidden_path(path: &Path) -> bool {
 }
 
 fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<ObfuscateResult> {
+    let request_id = require_request_id(&args.options)?;
     validate_files(&args.project_files)?;
-    let request_id = args
-        .options
-        .request_id
-        .unwrap_or_else(|| format!("req-{}", now_epoch_s()));
 
     let mut events = vec![];
     record_event(&mut events, "scanning");
 
     let files = to_file_entries(&args.project_files)?;
-    let mut forward_map = if args.manual_mapping.is_empty() {
-        state.default_mapping.get()
-    } else {
-        args.manual_mapping
-    };
+    let mut forward_map = state.default_mapping.get();
     if args.options.enrich_detected_terms.unwrap_or(false) {
         let terms = detect_terms(&files)?;
         enrich_with_random(&mut forward_map, &terms, &files, None);
@@ -1199,10 +1284,13 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
         mapping_payload.encryption = Some("not-configured".into());
     }
 
+    state
+        .request_mappings
+        .insert(request_id.clone(), mapping_payload.clone())?;
+
     Ok(ObfuscateResult {
         request_id,
         obfuscated_files,
-        mapping_payload,
         stats: Stats {
             file_count: files.len(),
             mapping_entries: forward_map.len(),
@@ -1212,16 +1300,13 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
 }
 
 fn deobfuscate_project(args: DeobfuscateArgs, state: &AppState) -> AppResult<DeobfuscateResult> {
+    let request_id = require_request_id(&args.options)?;
     validate_files(&args.llm_output_files)?;
-    let request_id = args
-        .options
-        .request_id
-        .unwrap_or_else(|| format!("req-{}", now_epoch_s()));
 
     let mut events = vec![];
     record_event(&mut events, "scanning");
 
-    let mapping_payload = resolve_deobfuscation_mapping(args.mapping_payload, state)?;
+    let mapping_payload = state.request_mappings.resolve(&request_id)?;
     validate_mapping_payload(&mapping_payload)?;
 
     let files = to_file_entries(&args.llm_output_files)?;
@@ -1246,26 +1331,6 @@ fn deobfuscate_project(args: DeobfuscateArgs, state: &AppState) -> AppResult<Deo
             mapping_entries: mapping_payload.mapping.reverse.len(),
         },
         events,
-    })
-}
-
-fn resolve_deobfuscation_mapping(
-    maybe_payload: Option<MappingPayload>,
-    state: &AppState,
-) -> AppResult<MappingPayload> {
-    if let Some(payload) = maybe_payload {
-        return Ok(payload);
-    }
-
-    let forward = state.default_mapping.get();
-    let reverse = invert(&forward)?;
-    Ok(MappingPayload {
-        mapping: MappingFile { forward, reverse },
-        created_at_epoch_s: now_epoch_s(),
-        expires_at_epoch_s: None,
-        signature: None,
-        encryption: None,
-        metadata: None,
     })
 }
 
@@ -1463,6 +1528,19 @@ fn validate_mapping_payload(payload: &MappingPayload) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+fn require_request_id(options: &ToolOptions) -> AppResult<String> {
+    let request_id = options
+        .request_id
+        .as_ref()
+        .ok_or_else(|| AppError::InvalidArg("options.request_id is required".into()))?;
+    if request_id.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "options.request_id cannot be empty".into(),
+        ));
+    }
+    Ok(request_id.clone())
 }
 
 fn sign_payload(payload: &MappingPayload) -> AppResult<String> {

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 APP := code-obfuscator
 TARGETS := x86_64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin
 
-.PHONY: build fmt clippy test unit integration e2e svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
+.PHONY: build fmt clippy test unit integration e2e e2e-blackbox svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
 
 build:
 	cargo build
@@ -24,6 +24,9 @@ integration:
 
 e2e:
 	cargo test --test e2e
+
+e2e-blackbox:
+	bash test/e2e_blackbox.sh
 
 svt:
 	cargo test --test svt -- --ignored

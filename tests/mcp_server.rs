@@ -1085,10 +1085,10 @@ fn mcp_obfuscate_project_from_paths_reads_files_in_mcp() {
     let project = dir.path().join("project");
     fs::create_dir_all(project.join("app")).expect("mkdirs");
     let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"mostbet":"mmm"}"#).expect("write mapping");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
     fs::write(
         project.join("app/query.py"),
-        "QUERY_1 = \"\"\"\nselect 1 from mostbet.users u where u.id in %(mostbet_user_ids)s\n\"\"\"\n",
+        "QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
     )
     .expect("write file");
 
@@ -1142,7 +1142,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     let project = dir.path().join("project");
     fs::create_dir_all(project.join("app")).expect("mkdirs");
     let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"mostbet":"mmm"}"#).expect("write mapping");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
@@ -1165,7 +1165,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
             "params":{
                 "name":"obfuscate_project",
                 "arguments":{
-                    "project_files":[{"path":"app/query.py","content":"QUERY_1 = \"\"\"\nselect 1 from mostbet.users u where u.id in %(mostbet_user_ids)s\n\"\"\"\n"}],
+                    "project_files":[{"path":"app/query.py","content":"QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n"}],
                     "options":{"request_id":"paths-deobfuscate-1"}
                 }
             }
@@ -1210,7 +1210,7 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     let content = payload["restored_files"][0]["content"]
         .as_str()
         .expect("content");
-    assert!(content.contains("select 1 from mostbet.users"), "{payload}");
+    assert!(content.contains("select 1 from bs.users"), "{payload}");
 
     drop(stdin);
     let _ = child.wait();

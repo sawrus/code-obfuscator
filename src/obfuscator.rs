@@ -1190,26 +1190,26 @@ mod tests {
 
     #[test]
     fn global_mode_replaces_inside_snake_case_but_not_larger_alnum_tokens() {
-        let map = BTreeMap::from([("mostbet".to_string(), "mmm".to_string())]);
+        let map = BTreeMap::from([("bs".to_string(), "mmm".to_string())]);
         let f = vec![FileEntry {
             rel: "a.sql".into(),
-            text: "mostbet.users %(mostbet_user_ids)s xmostbet9".into(),
+            text: "bs.users %(bs_user_ids)s xbs9".into(),
         }];
 
         let out = transform_files_global(&f, &map).expect("transform");
-        assert_eq!(out[0].1, "mmm.users %(mmm_user_ids)s xmostbet9");
+        assert_eq!(out[0].1, "mmm.users %(mmm_user_ids)s xbs9");
     }
 
     #[test]
     fn global_mode_does_not_replace_inside_larger_alnum_token() {
-        let map = BTreeMap::from([("mostbet".to_string(), "mmm".to_string())]);
+        let map = BTreeMap::from([("bs".to_string(), "mmm".to_string())]);
         let f = vec![FileEntry {
             rel: "a.txt".into(),
-            text: "xmostbet9".into(),
+            text: "xbs9".into(),
         }];
 
         let out = transform_files_global(&f, &map).expect("transform");
-        assert_eq!(out[0].1, "xmostbet9");
+        assert_eq!(out[0].1, "xbs9");
     }
 
     #[test]

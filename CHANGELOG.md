@@ -9,7 +9,7 @@
 ### Changed
 - MCP API moved to server-side mapping by `options.request_id`: client-side mapping inputs (`manual_mapping`, `mapping_payload`) were removed from active tool contracts.
 - `obfuscate_project`/`obfuscate_project_from_paths` now persist request mapping in MCP memory; `apply_llm_output`/`deobfuscate_*` resolve mapping only by `request_id`.
-- Global obfuscation boundary logic now replaces mapped terms inside snake_case fragments (e.g. `mostbet_user_ids -> mmm_user_ids`) while still avoiding replacements inside larger alphanumeric tokens.
+- Global obfuscation boundary logic now replaces mapped terms inside snake_case fragments (e.g. `bs_user_ids -> mmm_user_ids`) while still avoiding replacements inside larger alphanumeric tokens.
 - README and test prompt/docs were updated to the request-id workflow and blackbox validation steps.
 - Package version bumped to `0.5.0`.
 

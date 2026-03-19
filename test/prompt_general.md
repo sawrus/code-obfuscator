@@ -6,7 +6,8 @@
 
 ```text
 Работай только через MCP `code_obfuscator`.
-Сделай задачу end-to-end в `root_dir="<ROOT_DIR>"` с `options.request_id="<REQUEST_ID>"`: `tools/list` -> `list_project_tree` -> `obfuscate_project_from_paths` -> правки только в `obfuscated_files` -> `apply_llm_output` (только измененный subset) -> проверки (test/lint/build) до зелёного.
+Сделай задачу end-to-end в `root_dir="<ROOT_DIR_MCP>"` с `options.request_id="<REQUEST_ID>"`: `tools/list` -> `list_project_tree` -> `obfuscate_project_from_paths` -> правки только в `obfuscated_files` -> `apply_llm_output` (только измененный subset) -> проверки (test/lint/build) до зелёного.
+Важно: `root_dir` — путь внутри MCP runtime (например, `/workspace/projects/test`), а не путь хоста вида `/Users/...`.
 Нельзя: прямое чтение/запись файлов проекта, `deobfuscate_project*`, клиентские mapping-аргументы.
 При любой ошибке MCP/tool-call остановись и выведи точную ошибку.
 В финале: `applied_files`, что изменено по смыслу, какие проверки запущены и их итог.
@@ -27,7 +28,7 @@
    - `apply_llm_output`
 3) Не используй `deobfuscate_project*`.
 4) Не передавай клиентские mapping-аргументы.
-5) Используй `root_dir="<ROOT_DIR>"`.
+5) Используй `root_dir="<ROOT_DIR_MCP>"` (путь внутри MCP runtime, например `/workspace/projects/test`).
 6) Используй один и тот же `options.request_id="<REQUEST_ID>"` для всей задачи.
 7) В `apply_llm_output` передавай только изменённые файлы (subset из `obfuscated_files`).
 8) После каждого применения запускай релевантные проверки (test/lint/build); при падении исправляй и повторяй цикл.
@@ -51,7 +52,8 @@
 
 ```text
 Work only through MCP `code_obfuscator`.
-Complete the task end-to-end in `root_dir="<ROOT_DIR>"` with `options.request_id="<REQUEST_ID>"`: `tools/list` -> `list_project_tree` -> `obfuscate_project_from_paths` -> edit only `obfuscated_files` -> `apply_llm_output` (changed subset only) -> run checks (test/lint/build) until green.
+Complete the task end-to-end in `root_dir="<ROOT_DIR_MCP>"` with `options.request_id="<REQUEST_ID>"`: `tools/list` -> `list_project_tree` -> `obfuscate_project_from_paths` -> edit only `obfuscated_files` -> `apply_llm_output` (changed subset only) -> run checks (test/lint/build) until green.
+Important: `root_dir` must be a path inside the MCP runtime (for example, `/workspace/projects/test`), not a host path like `/Users/...`.
 Forbidden: direct project file reads/writes, `deobfuscate_project*`, client-side mapping arguments.
 If any MCP/tool call fails, stop and return the exact error.
 Final output must include: `applied_files`, semantic change summary, executed checks and results.
@@ -72,7 +74,7 @@ Mandatory rules:
    - `apply_llm_output`
 3) Do not use `deobfuscate_project*`.
 4) Do not send client-side mapping arguments.
-5) Use `root_dir="<ROOT_DIR>"`.
+5) Use `root_dir="<ROOT_DIR_MCP>"` (a path inside MCP runtime, e.g. `/workspace/projects/test`).
 6) Reuse the same `options.request_id="<REQUEST_ID>"` for the whole task.
 7) Send only changed files to `apply_llm_output` (subset of `obfuscated_files`).
 8) After each apply step, run relevant checks (test/lint/build); if failing, fix and iterate.

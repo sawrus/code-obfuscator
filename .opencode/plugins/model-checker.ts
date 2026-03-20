@@ -192,7 +192,10 @@ function formatTelegramMessage(passed: ModelResult[], failed: ModelResult[], sel
 async function sendTelegram(message: string) {
   const token = process.env.OPENCODE_TELEGRAM_BOT_TOKEN
   const chatID = process.env.OPENCODE_TELEGRAM_CHAT_ID
-  if (!token || !chatID) return
+  if (!token || !chatID) {
+    console.log("⚠️  Telegram notification skipped: OPENCODE_TELEGRAM_BOT_TOKEN or OPENCODE_TELEGRAM_CHAT_ID not set")
+    return
+  }
 
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -222,7 +225,6 @@ async function regenerateOpencodeJson(projectDir: string, selected: string, pass
       if (agentConfig.mode !== "subagent") continue
 
       config.agent[agentName].model = selected
-      config.agent[agentName].fallback = passed.filter((m) => m !== selected).slice(0, 3)
     }
 
     await writeFile(filePath, `${JSON.stringify(config, null, 2)}\n`, "utf-8")

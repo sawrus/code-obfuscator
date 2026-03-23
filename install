@@ -155,6 +155,38 @@ normalize_target() {
   echo "$os" "$arch"
 }
 
+target_triple_for() {
+  local os="$1"
+  local arch="$2"
+  case "${os}/${arch}" in
+    linux/x64) echo "x86_64-unknown-linux-gnu" ;;
+    linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+    darwin/x64) echo "x86_64-apple-darwin" ;;
+    darwin/arm64) echo "aarch64-apple-darwin" ;;
+    windows/x64) echo "x86_64-pc-windows-msvc" ;;
+    windows/arm64) echo "aarch64-pc-windows-msvc" ;;
+    *) print_message error "unsupported target combination: ${os}/${arch}"; exit 1 ;;
+  esac
+}
+
+release_candidates() {
+  local os="$1"
+  local arch="$2"
+  local triple
+  triple="$(target_triple_for "$os" "$arch")"
+
+  if [[ "$os" == "windows" ]]; then
+    echo "${APP}-${triple}.exe|binary"
+    echo "${APP}-${triple}.zip|archive"
+    echo "${APP}-${os}-${arch}.zip|archive"
+    return 0
+  fi
+
+  echo "${APP}-${triple}|binary"
+  echo "${APP}-${triple}.tar.gz|archive"
+  echo "${APP}-${os}-${arch}.tar.gz|archive"
+}
+
 latest_version_from_github() {
   [[ -n "$INSTALL_REPO" ]] || return 1
   require_cmd curl
@@ -262,25 +294,45 @@ install_from_archive() {
   rm -rf "$temp_dir"
 }
 
-download_archive() {
+download_release_payload() {
   local version="$1"
   read -r os arch < <(normalize_target)
-  local ext=".tar.gz"
-  [[ "$os" == "windows" ]] && ext=".zip"
-  local filename="${APP}-${os}-${arch}${ext}"
-  local url
-  url="$(release_url "$version" "$filename")" || {
+  local url filename kind temp_dir downloaded=false
+  local attempted=()
+
+  release_url "$version" "probe" >/dev/null 2>&1 || {
     print_message error "error: release download source is not configured; set CODE_OBFUSCATOR_INSTALL_REPO or CODE_OBFUSCATOR_INSTALL_BASE_URL"
     exit 1
   }
+
   require_cmd curl
-  local temp_dir archive
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/${APP}.download.XXXXXX")"
-  archive="$temp_dir/$filename"
-  print_message info "${MUTED}Downloading${NC} ${url}"
-  curl -fL "$url" -o "$archive"
-  archive_path="$archive"
-  install_from_archive
+  while IFS='|' read -r filename kind; do
+    [[ -n "${filename:-}" ]] || continue
+    url="$(release_url "$version" "$filename")"
+    attempted+=("$url")
+    print_message info "${MUTED}Trying${NC} ${url}"
+    if curl -fsSL "$url" -o "$temp_dir/$filename"; then
+      downloaded=true
+      if [[ "$kind" == "binary" ]]; then
+        install_payload "$temp_dir/$filename" "$version"
+      else
+        archive_path="$temp_dir/$filename"
+        install_from_archive
+      fi
+      break
+    fi
+  done < <(release_candidates "$os" "$arch")
+
+  if [[ "$downloaded" != true ]]; then
+    print_message error "error: failed to download a release asset for ${os}/${arch} version ${version}"
+    for attempted_url in "${attempted[@]}"; do
+      print_message error "  tried: ${attempted_url}"
+    done
+    rm -rf "$temp_dir"
+    exit 1
+  fi
+
   rm -rf "$temp_dir"
 }
 
@@ -345,7 +397,7 @@ else
     print_message error "error: no installation source selected. Use --from-source, --binary, --archive, or configure CODE_OBFUSCATOR_INSTALL_REPO for release downloads"
     exit 1
   }
-  download_archive "$requested_version"
+  download_release_payload "$requested_version"
 fi
 
 configure_shell_path

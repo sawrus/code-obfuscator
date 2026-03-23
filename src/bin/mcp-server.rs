@@ -37,6 +37,8 @@ const DEFAULT_TREE_MAX_DEPTH: usize = 6;
 const DEFAULT_TREE_MAX_ENTRIES: usize = 1_000;
 const MAX_TREE_MAX_DEPTH: usize = 32;
 const MAX_TREE_MAX_ENTRIES: usize = 20_000;
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REQUEST_ID_LENGTH: usize = 256;
 const REQUEST_MAPPING_TTL_SECONDS: u64 = 24 * 60 * 60;
 const REQUEST_MAPPING_MAX_ENTRIES: usize = 256;
 
@@ -570,6 +572,19 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
         {
             content_length = v.trim().parse::<usize>().unwrap_or(0);
         }
+    }
+
+    if content_length > MAX_HTTP_BODY_BYTES {
+        write_http_json(
+            stream,
+            400,
+            &json!({
+                "error": format!(
+                    "request body exceeds max size: {content_length} > {MAX_HTTP_BODY_BYTES}"
+                )
+            }),
+        )?;
+        return Ok(());
     }
 
     let mut body = vec![0_u8; content_length];
@@ -1269,7 +1284,11 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
         .and_then(|s| s.sign_mapping)
         .unwrap_or(false)
     {
-        mapping_payload.signature = Some(sign_payload(&mapping_payload)?);
+        let secret = require_env_secret(
+            "MAPPING_SECRET_KEY",
+            "security.sign_mapping is enabled for options.security.sign_mapping=true",
+        )?;
+        mapping_payload.signature = Some(sign_payload(&mapping_payload, &secret)?);
     }
 
     if args
@@ -1279,7 +1298,11 @@ fn obfuscate_project(args: ObfuscateArgs, state: &AppState) -> AppResult<Obfusca
         .and_then(|s| s.encrypt_mapping)
         .unwrap_or(false)
     {
-        mapping_payload.encryption = Some("not-configured".into());
+        let _encrypt_key = require_env_secret(
+            "MAPPING_ENCRYPT_KEY",
+            "security.encrypt_mapping is enabled for options.security.encrypt_mapping=true",
+        )?;
+        mapping_payload.encryption = Some("configured".into());
     }
 
     state
@@ -1481,6 +1504,11 @@ fn validate_files(files: &[ProjectFile]) -> AppResult<()> {
 }
 
 fn validate_rel_path(path: &str) -> AppResult<()> {
+    if path.contains('\0') {
+        return Err(AppError::InvalidArg(
+            "path contains null bytes and is invalid".into(),
+        ));
+    }
     let p = Path::new(path);
     if p.is_absolute() {
         return Err(AppError::InvalidArg(
@@ -1517,7 +1545,11 @@ fn validate_mapping_payload(payload: &MappingPayload) -> AppResult<()> {
     }
 
     if let Some(sig) = &payload.signature {
-        let expected = sign_payload(payload)?;
+        let secret = require_env_secret(
+            "MAPPING_SECRET_KEY",
+            "signed mapping payload validation is enabled",
+        )?;
+        let expected = sign_payload(payload, &secret)?;
         if &expected != sig {
             return Err(AppError::InvalidArg(
                 "mapping payload signature mismatch".into(),
@@ -1538,17 +1570,36 @@ fn require_request_id(options: &ToolOptions) -> AppResult<String> {
             "options.request_id cannot be empty".into(),
         ));
     }
+    if request_id.len() > MAX_REQUEST_ID_LENGTH {
+        return Err(AppError::InvalidArg(format!(
+            "options.request_id exceeds max length: {} > {}",
+            request_id.len(),
+            MAX_REQUEST_ID_LENGTH
+        )));
+    }
     Ok(request_id.clone())
 }
 
-fn sign_payload(payload: &MappingPayload) -> AppResult<String> {
+fn sign_payload(payload: &MappingPayload, secret: &str) -> AppResult<String> {
     let data = serde_json::to_string(&payload.mapping)?;
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
+    secret.hash(&mut hasher);
     payload.created_at_epoch_s.hash(&mut hasher);
     payload.expires_at_epoch_s.hash(&mut hasher);
     serde_json::to_string(&payload.metadata)?.hash(&mut hasher);
     Ok(format!("{:x}", hasher.finish()))
+}
+
+fn require_env_secret(key: &str, context: &str) -> AppResult<String> {
+    let value = env::var(key)
+        .map_err(|_| AppError::InvalidArg(format!("{key} is required when {context}")))?;
+    if value.trim().is_empty() {
+        return Err(AppError::InvalidArg(format!(
+            "{key} cannot be empty when {context}"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_env_bool(key: &str) -> Option<bool> {

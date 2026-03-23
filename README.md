@@ -2,6 +2,55 @@
 
 MCP server and CLI/TUI utility for safe code obfuscation before LLM usage and reverse application of LLM changes back to your project.
 
+## Architecture Diagrams
+
+### code obfuscator case
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CodeObfuscator as code obfuscator
+    participant AgentIDE as Agent IDE (Codex)
+    participant LLM
+    User->>CodeObfuscator: Prepare full project in obfuscated form
+    CodeObfuscator->>CodeObfuscator: Obfuscate selected project files
+    CodeObfuscator-->>AgentIDE: Return obfuscated project context
+    AgentIDE->>LLM: Send obfuscated context for implementation
+```
+
+### MCP Case
+
+```mermaid
+flowchart LR
+    user["User"] --> ide["Agent IDE<br/>e.g. Codex"]
+    ide --> llm["LLM"]
+    ide --> mcp["MCP server<br/>code-obfuscator"]
+    mcp --> project["Project files on disk"]
+    mcp -. "obfuscated_files / llm_output_files" .- llm
+```
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant IDE as Agent IDE (Codex)
+    participant MCP as MCP server
+    participant LLM
+    participant Project as Project / root_dir
+
+    User->>IDE: Request a code change
+    IDE->>MCP: list_project_tree / obfuscate_project_from_paths(..., options.request_id)
+    MCP->>Project: Read selected files
+    Project-->>MCP: Source files
+    MCP-->>IDE: obfuscated_files
+    IDE->>LLM: Send obfuscated_files only
+    LLM-->>IDE: Return modified obfuscated_files
+    IDE->>MCP: apply_llm_output(root_dir, llm_output_files, options.request_id)
+    MCP->>MCP: Deobfuscate LLM output
+    MCP->>Project: Apply restored files in root_dir
+    MCP-->>IDE: applied_files
+    IDE-->>User: Show result
+```
+
 ## CLI Quick Start
 
 ### install

@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn send_request(stdin: &mut impl Write, req: &Value) {
     let body = serde_json::to_vec(req).expect("serialize req");

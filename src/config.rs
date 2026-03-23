@@ -68,6 +68,10 @@ pub fn resolve_config_dir(
     xdg_config_home: Option<&std::ffi::OsStr>,
     appdata: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(xdg).join(APP_DIR_NAME));
+    }
+
     match os {
         "windows" => appdata
             .map(PathBuf::from)
@@ -79,11 +83,7 @@ pub fn resolve_config_dir(
                 .join("Application Support")
                 .join(APP_DIR_NAME),
         ),
-        _ => xdg_config_home
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| Some(home_dir.join(".config")))
-            .map(|base| base.join(APP_DIR_NAME)),
+        _ => Some(home_dir.join(".config").join(APP_DIR_NAME)),
     }
 }
 
@@ -144,5 +144,17 @@ mod tests {
             path,
             PathBuf::from("C:/Users/alice/AppData/Roaming/code-obfuscator")
         );
+    }
+
+    #[test]
+    fn macos_respects_xdg_config_home_override() {
+        let path = resolve_config_dir(
+            "macos",
+            Path::new("/Users/alice"),
+            Some(std::ffi::OsStr::new("/tmp/xdg")),
+            None,
+        )
+        .expect("path");
+        assert_eq!(path, PathBuf::from("/tmp/xdg/code-obfuscator"));
     }
 }

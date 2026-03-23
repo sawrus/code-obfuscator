@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/error.rs"]
 mod error;
 #[path = "../src/fs_ops.rs"]
@@ -42,7 +44,8 @@ fn bench_deep_and_global_mode_10k_files() {
     let deep_elapsed = deep_start.elapsed();
 
     let global_start = Instant::now();
-    let global_out = obfuscator::transform_files_global(&files, &mapping).expect("global transform");
+    let global_out =
+        obfuscator::transform_files_global(&files, &mapping).expect("global transform");
     let global_elapsed = global_start.elapsed();
 
     println!("Files: {n}");

@@ -6,9 +6,7 @@ TARGETS := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-
 .PHONY: help build install dev fmt lint clippy test unit integration install-e2e e2e e2e-blackbox svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
 
 help: ## List available targets
-	@awk 'BEGIN {FS = ":.*## "; printf "Available targets:
-"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-18s %s
-", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "; printf "Available targets:\n"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build the project
 	cargo build

@@ -10,10 +10,24 @@ pub fn transform_files_global(
     files: &[FileEntry],
     map: &BTreeMap<String, String>,
 ) -> AppResult<Vec<(PathBuf, String)>> {
-    Ok(files
-        .iter()
-        .map(|f| (f.rel.clone(), apply_global_mapping(&f.text, map)))
-        .collect())
+    transform_files_global_with_progress(files, map, |_, _| {})
+}
+
+pub fn transform_files_global_with_progress<F>(
+    files: &[FileEntry],
+    map: &BTreeMap<String, String>,
+    mut on_progress: F,
+) -> AppResult<Vec<(PathBuf, String)>>
+where
+    F: FnMut(usize, usize),
+{
+    let total = files.len();
+    let mut transformed = Vec::with_capacity(total);
+    for (idx, file) in files.iter().enumerate() {
+        transformed.push((file.rel.clone(), apply_global_mapping(&file.text, map)));
+        on_progress(idx + 1, total);
+    }
+    Ok(transformed)
 }
 
 fn apply_global_mapping(text: &str, map: &BTreeMap<String, String>) -> String {
@@ -64,24 +78,36 @@ pub fn transform_files(
     files: &[FileEntry],
     map: &BTreeMap<String, String>,
 ) -> AppResult<Vec<(PathBuf, String)>> {
+    transform_files_with_progress(files, map, |_, _| {})
+}
+
+pub fn transform_files_with_progress<F>(
+    files: &[FileEntry],
+    map: &BTreeMap<String, String>,
+    mut on_progress: F,
+) -> AppResult<Vec<(PathBuf, String)>>
+where
+    F: FnMut(usize, usize),
+{
     let globally_imported_python_symbols = collect_python_imported_symbols_from_files(files);
     let python_dataclass_index = collect_python_dataclass_index(files);
-    Ok(files
-        .iter()
-        .map(|f| {
-            let lang = detect_language(&f.rel, &f.text);
-            (
-                f.rel.clone(),
-                apply_rules(
-                    &f.text,
-                    map,
-                    lang,
-                    &globally_imported_python_symbols,
-                    &python_dataclass_index,
-                ),
-            )
-        })
-        .collect())
+    let total = files.len();
+    let mut transformed = Vec::with_capacity(total);
+    for (idx, file) in files.iter().enumerate() {
+        let lang = detect_language(&file.rel, &file.text);
+        transformed.push((
+            file.rel.clone(),
+            apply_rules(
+                &file.text,
+                map,
+                lang,
+                &globally_imported_python_symbols,
+                &python_dataclass_index,
+            ),
+        ));
+        on_progress(idx + 1, total);
+    }
+    Ok(transformed)
 }
 
 fn apply_rules(

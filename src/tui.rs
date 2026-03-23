@@ -131,10 +131,10 @@ fn prompt_forward_mapping<R: BufRead, W: Write>(
 
 fn prompt_mode<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> AppResult<Mode> {
     loop {
-        writeln!(writer, "Select mode: [1] forward, [2] reverse")?;
-        let value = read_line(reader, writer, "Mode")?;
+        writeln!(writer, "Select mode: [1] forward (default), [2] reverse")?;
+        let value = read_line(reader, writer, "Mode [1]")?;
         match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "forward" => return Ok(Mode::Forward),
+            "" | "1" | "forward" => return Ok(Mode::Forward),
             "2" | "reverse" => return Ok(Mode::Reverse),
             _ => writeln!(writer, "Please enter 1/forward or 2/reverse.")?,
         }
@@ -287,5 +287,22 @@ mod tests {
         assert!(matches!(request.mode, Mode::Reverse));
         assert_eq!(request.mapping, None);
         assert_eq!(request.seed, None);
+    }
+
+    #[test]
+    fn mode_defaults_to_forward_on_empty_input() {
+        let temp = tempfile::tempdir().expect("tmp");
+        let config = ConfigPaths {
+            dir: temp.path().to_path_buf(),
+            mapping_file: temp.path().join("mapping.json"),
+        };
+        std::fs::write(&config.mapping_file, "{}\n").expect("write mapping");
+
+        let input = b"\n/tmp/src\n/tmp/out\nn\ny\n\nn\n";
+        let mut reader = Cursor::new(&input[..]);
+        let mut writer = Vec::new();
+        let request = prompt_with_io(&mut reader, &mut writer, &config).expect("request");
+
+        assert!(matches!(request.mode, Mode::Forward));
     }
 }

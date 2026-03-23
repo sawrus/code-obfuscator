@@ -9,6 +9,7 @@ mod ollama;
 mod tui;
 
 use std::collections::BTreeMap;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use cli::{Args, Mode};
@@ -16,6 +17,8 @@ use config::ConfigPaths;
 use error::{AppError, AppResult};
 use mapping::{detect_terms, enrich_with_random, load_manual, load_mapping, save_mapping};
 use ollama::{OllamaConfig, suggest_mapping};
+
+const PROGRESS_BAR_WIDTH: usize = 30;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunRequest {
@@ -183,11 +186,7 @@ fn apply_and_save(
     map: BTreeMap<String, String>,
     input_mapping_path: Option<PathBuf>,
 ) -> AppResult<()> {
-    let transformed = if request.deep {
-        obfuscator::transform_files(&files, &map)?
-    } else {
-        obfuscator::transform_files_global(&files, &map)?
-    };
+    let transformed = transform_with_progress(&files, &map, request.deep, "Obfuscating")?;
     fs_ops::write_text_tree(&request.target, &transformed)?;
     let path = output_map_path(request);
     save_mapping(&path, &map)?;
@@ -199,14 +198,107 @@ fn reverse(request: &RunRequest) -> AppResult<()> {
     let path = input_map_path(request)?;
     let map_file = load_mapping(&path)?;
     let files = fs_ops::read_text_tree(&request.source)?;
-    let transformed = if request.deep {
-        obfuscator::transform_files(&files, &map_file.reverse)?
-    } else {
-        obfuscator::transform_files_global(&files, &map_file.reverse)?
-    };
+    let transformed =
+        transform_with_progress(&files, &map_file.reverse, request.deep, "Deobfuscating")?;
     fs_ops::write_text_tree(&request.target, &transformed)?;
     print_stats(files.len(), &map_file.reverse, Some(&path), &path);
     Ok(())
+}
+
+fn transform_with_progress(
+    files: &[fs_ops::FileEntry],
+    map: &BTreeMap<String, String>,
+    deep: bool,
+    stage: &'static str,
+) -> AppResult<Vec<(PathBuf, String)>> {
+    if !io::stdout().is_terminal() || files.is_empty() {
+        return if deep {
+            obfuscator::transform_files(files, map)
+        } else {
+            obfuscator::transform_files_global(files, map)
+        };
+    }
+
+    let mut progress = ProgressPrinter::new(stage, files.len());
+    let transformed = if deep {
+        obfuscator::transform_files_with_progress(files, map, |done, total| {
+            progress.update(done, total);
+        })?
+    } else {
+        obfuscator::transform_files_global_with_progress(files, map, |done, total| {
+            progress.update(done, total);
+        })?
+    };
+    progress.finish();
+    Ok(transformed)
+}
+
+struct ProgressPrinter {
+    enabled: bool,
+    stage: &'static str,
+    total: usize,
+    update_step: usize,
+    last_reported: usize,
+}
+
+impl ProgressPrinter {
+    fn new(stage: &'static str, total: usize) -> Self {
+        let enabled = io::stdout().is_terminal() && total > 0;
+        let update_step = (total / 100).max(1);
+        let progress = Self {
+            enabled,
+            stage,
+            total,
+            update_step,
+            last_reported: 0,
+        };
+        if progress.enabled {
+            progress.render(0);
+        }
+        progress
+    }
+
+    fn update(&mut self, done: usize, total: usize) {
+        if !self.enabled {
+            return;
+        }
+
+        if total != self.total {
+            self.total = total;
+            self.update_step = (self.total / 100).max(1);
+        }
+
+        let done = done.min(self.total);
+        if done < self.total && done.saturating_sub(self.last_reported) < self.update_step {
+            return;
+        }
+        self.last_reported = done;
+        self.render(done);
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.render(self.total);
+        println!();
+    }
+
+    fn render(&self, done: usize) {
+        let safe_total = self.total.max(1);
+        let done = done.min(self.total);
+        let filled = done.saturating_mul(PROGRESS_BAR_WIDTH) / safe_total;
+        let empty = PROGRESS_BAR_WIDTH.saturating_sub(filled);
+        let percent = done.saturating_mul(100) / safe_total;
+        print!(
+            "\r{stage}: [{filled_bar}{empty_bar}] {done}/{total} ({percent}%)",
+            stage = self.stage,
+            filled_bar = "=".repeat(filled),
+            empty_bar = "-".repeat(empty),
+            total = self.total
+        );
+        let _ = io::stdout().flush();
+    }
 }
 
 fn resolve_forward_mapping_path(request: &RunRequest, config: &ConfigPaths) -> Option<PathBuf> {

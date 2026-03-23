@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="code-obfuscator"
+INSTALL_HOME="${CODE_OBFUSCATOR_HOME:-${HOME}/.${APP}}"
+INSTALL_BIN_DIR="${CODE_OBFUSCATOR_INSTALL_DIR:-${HOME}/.local/bin}"
+RELEASES_DIR="${INSTALL_HOME}/releases"
+MANAGED_BIN_DIR="${INSTALL_HOME}/bin"
+VERSION_FILE="${INSTALL_HOME}/current-version"
+INSTALL_REPO="${CODE_OBFUSCATOR_INSTALL_REPO:-}"
+INSTALL_BASE_URL="${CODE_OBFUSCATOR_INSTALL_BASE_URL:-}"
+MUTED='\033[0;2m'
+RED='\033[0;31m'
+ORANGE='\033[38;5;214m'
+NC='\033[0m'
+
+requested_version="${VERSION:-}"
+binary_path=""
+archive_path=""
+from_source=false
+no_modify_path=false
+
+usage() {
+  cat <<USAGE
+Install ${APP}.
+
+Usage:
+  ./install [options]
+
+Options:
+  --from-source          Build from the current repository checkout and install it
+  -b, --binary PATH      Install from an already-built local binary
+  -a, --archive PATH     Install from a local release archive (.tar.gz or .zip)
+  -v, --version VERSION  Install a specific release version
+  --no-modify-path       Do not modify shell config files
+  -h, --help             Show this help
+
+Environment:
+  CODE_OBFUSCATOR_HOME           Managed install root (default: ~/.code-obfuscator)
+  CODE_OBFUSCATOR_INSTALL_DIR    User-local bin dir (default: ~/.local/bin)
+  CODE_OBFUSCATOR_INSTALL_REPO   GitHub repo slug for release downloads (owner/repo)
+  CODE_OBFUSCATOR_INSTALL_BASE_URL Override release download base URL
+
+Examples:
+  ./install --from-source
+  ./install --binary ./target/release/code-obfuscator
+  ./install --archive ./dist/code-obfuscator-linux-x64.tar.gz --version 0.5.0
+  curl -fsSL <raw-install-url> | bash -s -- --version 0.5.0
+USAGE
+}
+
+print_message() {
+  local level=$1
+  local message=$2
+  local color="$NC"
+  case "$level" in
+    error) color="$RED" ;;
+    warning) color="$ORANGE" ;;
+  esac
+  echo -e "${color}${message}${NC}"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    print_message error "error: required command not found: $1"
+    exit 1
+  }
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --from-source)
+      from_source=true
+      shift
+      ;;
+    -b|--binary)
+      [[ -n "${2:-}" ]] || { print_message error "error: --binary requires a path"; exit 1; }
+      binary_path="$2"
+      shift 2
+      ;;
+    -a|--archive)
+      [[ -n "${2:-}" ]] || { print_message error "error: --archive requires a path"; exit 1; }
+      archive_path="$2"
+      shift 2
+      ;;
+    -v|--version)
+      [[ -n "${2:-}" ]] || { print_message error "error: --version requires a value"; exit 1; }
+      requested_version="${2#v}"
+      shift 2
+      ;;
+    --no-modify-path)
+      no_modify_path=true
+      shift
+      ;;
+    *)
+      print_message warning "warning: unknown option '$1'"
+      shift
+      ;;
+  esac
+done
+
+selection_count=0
+[[ -n "$binary_path" ]] && selection_count=$((selection_count + 1))
+[[ -n "$archive_path" ]] && selection_count=$((selection_count + 1))
+[[ "$from_source" == true ]] && selection_count=$((selection_count + 1))
+if [[ $selection_count -gt 1 ]]; then
+  print_message error "error: choose only one of --from-source, --binary, or --archive"
+  exit 1
+fi
+
+mkdir -p "$RELEASES_DIR" "$MANAGED_BIN_DIR" "$INSTALL_BIN_DIR"
+
+resolve_repo_root() {
+  local pwd_root
+  pwd_root="$(pwd)"
+  if [[ -f "$pwd_root/Cargo.toml" ]]; then
+    echo "$pwd_root"
+    return 0
+  fi
+  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$script_dir/Cargo.toml" ]]; then
+      echo "$script_dir"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+repo_root=""
+if repo_root="$(resolve_repo_root 2>/dev/null)"; then
+  :
+fi
+
+normalize_target() {
+  local raw_os raw_arch os arch
+  raw_os="$(uname -s)"
+  raw_arch="$(uname -m)"
+  case "$raw_os" in
+    Linux*) os="linux" ;;
+    Darwin*) os="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *) print_message error "unsupported operating system: $raw_os"; exit 1 ;;
+  esac
+  case "$raw_arch" in
+    x86_64|amd64) arch="x64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) print_message error "unsupported architecture: $raw_arch"; exit 1 ;;
+  esac
+  echo "$os" "$arch"
+}
+
+latest_version_from_github() {
+  [[ -n "$INSTALL_REPO" ]] || return 1
+  require_cmd curl
+  curl -fsSL "https://api.github.com/repos/${INSTALL_REPO}/releases/latest" \
+    | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' \
+    | head -n1
+}
+
+release_url() {
+  local version="$1"
+  local filename="$2"
+  if [[ -n "$INSTALL_BASE_URL" ]]; then
+    echo "${INSTALL_BASE_URL%/}/v${version}/${filename}"
+    return 0
+  fi
+  [[ -n "$INSTALL_REPO" ]] || return 1
+  echo "https://github.com/${INSTALL_REPO}/releases/download/v${version}/${filename}"
+}
+
+install_payload() {
+  local payload_bin="$1"
+  local version="$2"
+  local resolved_version="${version:-local}"
+  local release_dir="${RELEASES_DIR}/${resolved_version}"
+  local release_bin_dir="${release_dir}/bin"
+  local managed_bin="${MANAGED_BIN_DIR}/${APP}"
+  local final_bin="${release_bin_dir}/${APP}"
+
+  mkdir -p "$release_bin_dir"
+  cp "$payload_bin" "$final_bin"
+  chmod 755 "$final_bin"
+
+  cp "$final_bin" "$managed_bin"
+  chmod 755 "$managed_bin"
+  printf '%s\n' "$resolved_version" > "$VERSION_FILE"
+
+  rm -f "${INSTALL_BIN_DIR}/${APP}"
+  if ln -s "$managed_bin" "${INSTALL_BIN_DIR}/${APP}" 2>/dev/null; then
+    :
+  else
+    cp "$managed_bin" "${INSTALL_BIN_DIR}/${APP}"
+    chmod 755 "${INSTALL_BIN_DIR}/${APP}"
+  fi
+
+  print_message info "${MUTED}Installed ${APP}${NC} ${resolved_version} ${MUTED}into${NC} ${INSTALL_HOME}"
+  print_message info "${MUTED}Executable available at${NC} ${INSTALL_BIN_DIR}/${APP}"
+}
+
+install_from_binary() {
+  local version="${requested_version:-local}"
+  [[ -f "$binary_path" ]] || { print_message error "error: binary not found at $binary_path"; exit 1; }
+  install_payload "$binary_path" "$version"
+}
+
+install_from_source() {
+  [[ -n "$repo_root" ]] || { print_message error "error: --from-source must be run from a repository checkout"; exit 1; }
+  require_cmd cargo
+  print_message info "${MUTED}Building ${APP} from source in${NC} ${repo_root}"
+  cargo build --release --bin "$APP" --manifest-path "$repo_root/Cargo.toml"
+  binary_path="$repo_root/target/release/${APP}"
+  requested_version="${requested_version:-$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml" | head -n1)}"
+  install_from_binary
+}
+
+extract_archive_to_temp() {
+  local archive="$1"
+  local temp_dir="$2"
+  case "$archive" in
+    *.tar.gz|*.tgz)
+      require_cmd tar
+      tar -xzf "$archive" -C "$temp_dir"
+      ;;
+    *.zip)
+      require_cmd unzip
+      unzip -q "$archive" -d "$temp_dir"
+      ;;
+    *)
+      print_message error "error: unsupported archive format: $archive"
+      exit 1
+      ;;
+  esac
+}
+
+find_binary_in_dir() {
+  local search_dir="$1"
+  local candidate
+  candidate="$(find "$search_dir" -type f \( -name "$APP" -o -name "${APP}.exe" \) | head -n1)"
+  [[ -n "$candidate" ]] || {
+    print_message error "error: could not locate ${APP} binary inside extracted archive"
+    exit 1
+  }
+  echo "$candidate"
+}
+
+install_from_archive() {
+  [[ -f "$archive_path" ]] || { print_message error "error: archive not found at $archive_path"; exit 1; }
+  local temp_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/${APP}.archive.XXXXXX")"
+  trap 'rm -rf "$temp_dir"' RETURN
+  extract_archive_to_temp "$archive_path" "$temp_dir"
+  local archive_bin
+  archive_bin="$(find_binary_in_dir "$temp_dir")"
+  install_payload "$archive_bin" "${requested_version:-archive}"
+  trap - RETURN
+  rm -rf "$temp_dir"
+}
+
+download_archive() {
+  local version="$1"
+  read -r os arch < <(normalize_target)
+  local ext=".tar.gz"
+  [[ "$os" == "windows" ]] && ext=".zip"
+  local filename="${APP}-${os}-${arch}${ext}"
+  local url
+  url="$(release_url "$version" "$filename")" || {
+    print_message error "error: release download source is not configured; set CODE_OBFUSCATOR_INSTALL_REPO or CODE_OBFUSCATOR_INSTALL_BASE_URL"
+    exit 1
+  }
+  require_cmd curl
+  local temp_dir archive
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/${APP}.download.XXXXXX")"
+  archive="$temp_dir/$filename"
+  print_message info "${MUTED}Downloading${NC} ${url}"
+  curl -fL "$url" -o "$archive"
+  archive_path="$archive"
+  install_from_archive
+  rm -rf "$temp_dir"
+}
+
+add_to_path() {
+  local config_file="$1"
+  local line="$2"
+  if grep -Fqx "$line" "$config_file" 2>/dev/null; then
+    print_message info "${MUTED}PATH entry already present in${NC} ${config_file}"
+    return 0
+  fi
+  printf '\n# %s\n%s\n' "$APP" "$line" >> "$config_file"
+  print_message info "${MUTED}Added PATH entry to${NC} ${config_file}"
+}
+
+configure_shell_path() {
+  [[ "$no_modify_path" == true ]] && return 0
+  case "$(basename "${SHELL:-sh}")" in
+    zsh)
+      local file="${ZDOTDIR:-$HOME}/.zshrc"
+      touch "$file"
+      add_to_path "$file" "export PATH=${INSTALL_BIN_DIR}:\$PATH"
+      ;;
+    fish)
+      local dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish"
+      local file="${dir}/config.fish"
+      mkdir -p "$dir"
+      touch "$file"
+      add_to_path "$file" "fish_add_path ${INSTALL_BIN_DIR}"
+      ;;
+    *)
+      local file="$HOME/.bashrc"
+      touch "$file"
+      add_to_path "$file" "export PATH=${INSTALL_BIN_DIR}:\$PATH"
+      ;;
+  esac
+}
+
+show_next_steps() {
+  echo
+  if [[ ":$PATH:" == *":${INSTALL_BIN_DIR}:"* ]]; then
+    print_message info "${MUTED}${INSTALL_BIN_DIR} is already on PATH${NC}"
+  else
+    print_message warning "Add ${INSTALL_BIN_DIR} to PATH or restart your shell if needed"
+  fi
+  if [[ -f "$VERSION_FILE" ]]; then
+    print_message info "${MUTED}Current installed version:${NC} $(cat "$VERSION_FILE")"
+  fi
+  print_message info "${MUTED}Try:${NC} ${APP} --help"
+}
+
+if [[ -n "$binary_path" ]]; then
+  install_from_binary
+elif [[ -n "$archive_path" ]]; then
+  install_from_archive
+elif [[ "$from_source" == true ]]; then
+  install_from_source
+else
+  if [[ -z "$requested_version" ]]; then
+    requested_version="$(latest_version_from_github || true)"
+  fi
+  [[ -n "$requested_version" ]] || {
+    print_message error "error: no installation source selected. Use --from-source, --binary, --archive, or configure CODE_OBFUSCATOR_INSTALL_REPO for release downloads"
+    exit 1
+  }
+  download_archive "$requested_version"
+fi
+
+configure_shell_path
+show_next_steps

@@ -1,59 +1,74 @@
 SHELL := /bin/bash
 
 APP := code-obfuscator
-TARGETS := x86_64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin
+TARGETS := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin
 
-.PHONY: build fmt clippy test unit integration e2e e2e-blackbox svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
+.PHONY: help build install dev fmt lint clippy test unit integration install-e2e e2e e2e-blackbox svt coverage release-cross release-artifacts ci mcp-docker-build mcp-docker-run clean
 
-build:
+help: ## List available targets
+	@awk 'BEGIN {FS = ":.*## "; printf "Available targets:
+"} /^[a-zA-Z0-9_.-]+:.*## / {printf "  %-18s %s
+", $$1, $$2}' $(MAKEFILE_LIST)
+
+build: ## Build the project
 	cargo build
 
-fmt:
+install: ## Build and install via the managed installer lifecycle
+	./install --from-source
+
+dev: ## Show CLI help for local development
+	cargo run -- --help
+
+fmt: ## Format all Rust code
 	cargo fmt --all
 
-clippy:
+lint: fmt clippy ## Run formatting and linting
+
+clippy: ## Run clippy with warnings denied
 	cargo clippy --all-targets --all-features -- -D warnings
 
-test: unit integration e2e
+test: unit integration install-e2e e2e ## Run the main automated test suites
 
-unit:
+unit: ## Run unit tests for binaries
 	cargo test --bins
 
-integration:
+integration: ## Run MCP server integration tests
 	cargo test --test mcp_server
 
-e2e:
+install-e2e: ## Run installer lifecycle tests
+	cargo test --test install_script
+
+e2e: ## Run CLI end-to-end tests
 	cargo test --test e2e
 
-e2e-blackbox:
+e2e-blackbox: ## Run the black-box shell scenario
 	bash test/e2e_blackbox.sh
 
-svt:
+svt: ## Run ignored stress-validation tests
 	cargo test --test svt -- --ignored
 
-coverage:
+coverage: ## Generate coverage report
 	cargo llvm-cov --workspace --all-features --fail-under-lines 70 --lcov --output-path coverage.lcov
 
-release-cross:
+release-cross: ## Build release binaries for supported targets
 	@for t in $(TARGETS); do \
 		cargo build --release --target $$t; \
 	done
 
-release-artifacts: release-cross
+release-artifacts: release-cross ## Package release archives expected by the installer
 	@mkdir -p dist
 	@for t in $(TARGETS); do \
-		if [ -f target/$$t/release/$(APP) ]; then cp target/$$t/release/$(APP) dist/$(APP)-$$t; fi; \
-		if [ -f target/$$t/release/$(APP).exe ]; then cp target/$$t/release/$(APP).exe dist/$(APP)-$$t.exe; fi; \
+		if [ -f target/$$t/release/$(APP) ]; then ./scripts/package-release.sh $$t target/$$t/release/$(APP) dist; fi; \
+		if [ -f target/$$t/release/$(APP).exe ]; then ./scripts/package-release.sh $$t target/$$t/release/$(APP).exe dist; fi; \
 	done
 
-ci: fmt clippy test coverage
+ci: lint test coverage ## Run CI-equivalent local checks
 
-clean:
-	cargo clean
-
-
-mcp-docker-build:
+mcp-docker-build: ## Build the local MCP Docker image
 	docker build -f docker/mcp.Dockerfile -t code-obfuscator-mcp:local .
 
-mcp-docker-run: mcp-docker-build
+mcp-docker-run: mcp-docker-build ## Run the local MCP Docker image
 	docker run --rm -i code-obfuscator-mcp:local
+
+clean: ## Remove Cargo build artifacts
+	cargo clean

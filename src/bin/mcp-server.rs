@@ -138,9 +138,7 @@ impl RequestMappingStore {
             .get(request_id)
             .cloned()
             .map(|stored| stored.mapping)
-            .ok_or_else(|| {
-                AppError::InvalidArg(format!("unknown request_id: {request_id}"))
-            })
+            .ok_or_else(|| AppError::InvalidArg(format!("unknown request_id: {request_id}")))
     }
 
     fn cleanup_locked(&self, guard: &mut BTreeMap<String, StoredRequestMapping>, now: u64) {

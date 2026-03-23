@@ -1,18 +1,41 @@
 mod cli;
+mod config;
 mod error;
 mod fs_ops;
 mod language;
 mod mapping;
 mod obfuscator;
 mod ollama;
+mod tui;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cli::{Args, Mode};
+use config::ConfigPaths;
 use error::{AppError, AppResult};
 use mapping::{detect_terms, enrich_with_random, load_manual, load_mapping, save_mapping};
 use ollama::{OllamaConfig, suggest_mapping};
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunRequest {
+    mode: Mode,
+    source: PathBuf,
+    target: PathBuf,
+    mapping: Option<PathBuf>,
+    output_mapping: Option<PathBuf>,
+    deep: bool,
+    ollama_url: Option<String>,
+    ollama_model: Option<String>,
+    ollama_top_n: usize,
+    seed: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct MappingSelection {
+    path: Option<PathBuf>,
+    values: BTreeMap<String, String>,
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -23,51 +46,120 @@ fn main() {
 
 fn run() -> AppResult<()> {
     let args = cli::parse();
-    validate(&args)?;
-    std::fs::create_dir_all(&args.target)?;
-    match args.mode {
-        Mode::Forward => forward(&args),
-        Mode::Reverse => reverse(&args),
+    let config = ConfigPaths::discover()?;
+    let use_tui = args.tui || !args.is_non_interactive();
+    let request = if use_tui {
+        tui::prompt(&config)?
+    } else {
+        build_non_interactive_request(args)?
+    };
+
+    execute(&request, &config)
+}
+
+fn build_non_interactive_request(args: Args) -> AppResult<RunRequest> {
+    if !args.is_non_interactive() {
+        return err("either pass non-interactive flags (--mode/--source/--target) or use --tui");
+    }
+
+    Ok(RunRequest {
+        mode: args.mode.ok_or_else(|| {
+            AppError::InvalidArg("--mode is required unless --tui is used".into())
+        })?,
+        source: args.source.ok_or_else(|| {
+            AppError::InvalidArg("--source is required unless --tui is used".into())
+        })?,
+        target: args.target.ok_or_else(|| {
+            AppError::InvalidArg("--target is required unless --tui is used".into())
+        })?,
+        mapping: args.mapping,
+        output_mapping: args.output_mapping,
+        deep: args.deep,
+        ollama_url: args.ollama_url,
+        ollama_model: args.ollama_model,
+        ollama_top_n: args.ollama_top_n,
+        seed: args.seed,
+    })
+}
+
+fn execute(request: &RunRequest, config: &ConfigPaths) -> AppResult<()> {
+    validate(request, config)?;
+    std::fs::create_dir_all(&request.target)?;
+    match request.mode {
+        Mode::Forward => forward(request, config),
+        Mode::Reverse => reverse(request),
     }
 }
 
-fn validate(args: &Args) -> AppResult<()> {
-    if !args.source.exists() {
+fn validate(request: &RunRequest, config: &ConfigPaths) -> AppResult<()> {
+    if !request.source.exists() {
         return err("source directory does not exist");
     }
-    if !args.source.is_dir() {
+    if !request.source.is_dir() {
         return err("source must be a directory");
     }
-    if matches!(args.mode, Mode::Forward) && !args.deep && args.mapping.is_none() {
+    if matches!(request.mode, Mode::Forward)
+        && !request.deep
+        && resolve_forward_mapping_path(request, config).is_none()
+    {
         return err("mapping is required in forward mode unless --deep is set");
     }
     Ok(())
 }
 
-fn err(msg: &str) -> AppResult<()> {
+fn err<T>(msg: &str) -> AppResult<T> {
     Err(AppError::InvalidArg(msg.into()))
 }
 
-fn forward(args: &Args) -> AppResult<()> {
-    let files = fs_ops::read_text_tree(&args.source)?;
-    if !args.deep {
-        let map = load_manual(args.mapping.as_deref())?;
-        return apply_and_save(args, files, map);
+fn forward(request: &RunRequest, config: &ConfigPaths) -> AppResult<()> {
+    let files = fs_ops::read_text_tree(&request.source)?;
+    let mapping_selection = load_forward_mapping(request, config)?;
+
+    if !request.deep {
+        return apply_and_save(
+            request,
+            files,
+            mapping_selection.values,
+            mapping_selection.path,
+        );
     }
 
-    let mut map = load_manual(args.mapping.as_deref())?;
+    let mut map = mapping_selection.values;
     let terms = detect_terms(&files)?;
-    merge_ai(args, &terms, &mut map)?;
-    enrich_with_random(&mut map, &terms, &files, args.seed);
-    apply_and_save(args, files, map)
+    merge_ai(request, &terms, &mut map)?;
+    enrich_with_random(&mut map, &terms, &files, request.seed);
+    apply_and_save(request, files, map, mapping_selection.path)
+}
+
+fn load_forward_mapping(request: &RunRequest, config: &ConfigPaths) -> AppResult<MappingSelection> {
+    if let Some(path) = request.mapping.as_ref() {
+        let values = load_manual(Some(path))?;
+        config.persist_default_mapping(&values)?;
+        return Ok(MappingSelection {
+            path: Some(path.clone()),
+            values,
+        });
+    }
+
+    if let Some(path) = config.default_mapping_path_if_exists() {
+        return Ok(MappingSelection {
+            values: config.load_default_mapping()?,
+            path: Some(path),
+        });
+    }
+
+    Ok(MappingSelection {
+        path: None,
+        values: BTreeMap::new(),
+    })
 }
 
 fn merge_ai(
-    args: &Args,
+    request: &RunRequest,
     terms: &std::collections::BTreeSet<String>,
     map: &mut BTreeMap<String, String>,
 ) -> AppResult<()> {
-    let Some(cfg) = ollama_cfg(args) else {
+    let Some(cfg) = ollama_cfg(request) else {
         return Ok(());
     };
     let ai = suggest_mapping(&cfg, &terms.iter().cloned().collect::<Vec<_>>())?;
@@ -77,56 +169,65 @@ fn merge_ai(
     Ok(())
 }
 
-fn ollama_cfg(args: &Args) -> Option<OllamaConfig> {
+fn ollama_cfg(request: &RunRequest) -> Option<OllamaConfig> {
     Some(OllamaConfig {
-        url: args.ollama_url.clone()?,
-        model: args.ollama_model.clone()?,
-        top_n: args.ollama_top_n,
+        url: request.ollama_url.clone()?,
+        model: request.ollama_model.clone()?,
+        top_n: request.ollama_top_n,
     })
 }
 
 fn apply_and_save(
-    args: &Args,
+    request: &RunRequest,
     files: Vec<fs_ops::FileEntry>,
     map: BTreeMap<String, String>,
+    input_mapping_path: Option<PathBuf>,
 ) -> AppResult<()> {
-    let transformed = if args.deep {
+    let transformed = if request.deep {
         obfuscator::transform_files(&files, &map)?
     } else {
         obfuscator::transform_files_global(&files, &map)?
     };
-    fs_ops::write_text_tree(&args.target, &transformed)?;
-    let path = output_map_path(args);
+    fs_ops::write_text_tree(&request.target, &transformed)?;
+    let path = output_map_path(request);
     save_mapping(&path, &map)?;
-    print_stats(files.len(), &map, &path);
+    print_stats(files.len(), &map, input_mapping_path.as_deref(), &path);
     Ok(())
 }
 
-fn reverse(args: &Args) -> AppResult<()> {
-    let path = input_map_path(args)?;
+fn reverse(request: &RunRequest) -> AppResult<()> {
+    let path = input_map_path(request)?;
     let map_file = load_mapping(&path)?;
-    let files = fs_ops::read_text_tree(&args.source)?;
-    let transformed = if args.deep {
+    let files = fs_ops::read_text_tree(&request.source)?;
+    let transformed = if request.deep {
         obfuscator::transform_files(&files, &map_file.reverse)?
     } else {
         obfuscator::transform_files_global(&files, &map_file.reverse)?
     };
-    fs_ops::write_text_tree(&args.target, &transformed)?;
-    print_stats(files.len(), &map_file.reverse, &path);
+    fs_ops::write_text_tree(&request.target, &transformed)?;
+    print_stats(files.len(), &map_file.reverse, Some(&path), &path);
     Ok(())
 }
 
-fn output_map_path(args: &Args) -> PathBuf {
-    args.output_mapping
+fn resolve_forward_mapping_path(request: &RunRequest, config: &ConfigPaths) -> Option<PathBuf> {
+    request
+        .mapping
         .clone()
-        .unwrap_or_else(|| args.target.join("mapping.generated.json"))
+        .or_else(|| config.default_mapping_path_if_exists())
 }
 
-fn input_map_path(args: &Args) -> AppResult<PathBuf> {
-    if let Some(p) = args.mapping.clone() {
+fn output_map_path(request: &RunRequest) -> PathBuf {
+    request
+        .output_mapping
+        .clone()
+        .unwrap_or_else(|| request.target.join("mapping.generated.json"))
+}
+
+fn input_map_path(request: &RunRequest) -> AppResult<PathBuf> {
+    if let Some(p) = request.mapping.clone() {
         return Ok(p);
     }
-    let default = args.source.join("mapping.generated.json");
+    let default = request.source.join("mapping.generated.json");
     if default.exists() {
         return Ok(default);
     }
@@ -135,8 +236,16 @@ fn input_map_path(args: &Args) -> AppResult<PathBuf> {
     ))
 }
 
-fn print_stats(files: usize, map: &BTreeMap<String, String>, path: &Path) {
+fn print_stats(
+    files: usize,
+    map: &BTreeMap<String, String>,
+    input_mapping_path: Option<&Path>,
+    path: &Path,
+) {
     println!("processed_files={files}");
     println!("mapping_entries={}", map.len());
+    if let Some(input_mapping_path) = input_mapping_path {
+        println!("mapping_input_path={}", input_mapping_path.display());
+    }
     println!("mapping_path={}", path.display());
 }

@@ -68,6 +68,7 @@ fn fails_without_mapping_in_reverse_mode() {
 fn fails_without_mapping_in_forward_mode_by_default() {
     let src = tempdir().expect("src");
     let out = tempdir().expect("out");
+    let cfg = tempdir().expect("cfg");
     fs::write(src.path().join("main.py"), "print('ok')\n").expect("write");
 
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
@@ -76,7 +77,8 @@ fn fails_without_mapping_in_forward_mode_by_default() {
         .arg("--source")
         .arg(src.path())
         .arg("--target")
-        .arg(out.path());
+        .arg(out.path())
+        .env("XDG_CONFIG_HOME", cfg.path());
     cmd.assert().failure().stderr(predicate::str::contains(
         "mapping is required in forward mode unless --deep is set",
     ));
@@ -103,6 +105,142 @@ fn forward_with_deep_without_mapping_succeeds() {
     cmd.assert().success();
 
     assert!(obf.path().join("mapping.generated.json").exists());
+}
+
+#[test]
+fn forward_uses_config_default_mapping_when_flag_is_omitted() {
+    let src = tempdir().expect("src");
+    let out = tempdir().expect("out");
+    let cfg = tempdir().expect("cfg");
+    fs::write(
+        src.path().join("main.py"),
+        "def freeze(user_id):
+    return user_id
+",
+    )
+    .expect("write src");
+
+    let config_dir = cfg.path().join("xdg");
+    let app_dir = config_dir.join("code-obfuscator");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::write(
+        app_dir.join("mapping.json"),
+        r#"{"freeze":"run_task","user_id":"subject_id"}"#,
+    )
+    .expect("write mapping");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(out.path())
+        .env("XDG_CONFIG_HOME", &config_dir);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("mapping_input_path="));
+
+    let out_file = fs::read_to_string(out.path().join("main.py")).expect("read output");
+    assert!(out_file.contains("run_task"));
+    assert!(out_file.contains("subject_id"));
+}
+
+#[test]
+fn explicit_mapping_overrides_and_updates_config_default() {
+    let src = tempdir().expect("src");
+    let out = tempdir().expect("out");
+    let cfg = tempdir().expect("cfg");
+    fs::write(
+        src.path().join("main.py"),
+        "def freeze(user_id):
+    return user_id
+",
+    )
+    .expect("write src");
+
+    let config_dir = cfg.path().join("xdg");
+    let app_dir = config_dir.join("code-obfuscator");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::write(
+        app_dir.join("mapping.json"),
+        r#"{"freeze":"from_config","user_id":"config_user"}"#,
+    )
+    .expect("write config mapping");
+
+    let explicit = src.path().join("mapping.json");
+    fs::write(&explicit, r#"{"freeze":"from_flag","user_id":"flag_user"}"#)
+        .expect("write explicit mapping");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.arg("--mode")
+        .arg("forward")
+        .arg("--source")
+        .arg(src.path())
+        .arg("--target")
+        .arg(out.path())
+        .arg("--mapping")
+        .arg(&explicit)
+        .env("XDG_CONFIG_HOME", &config_dir);
+    cmd.assert().success();
+
+    let out_file = fs::read_to_string(out.path().join("main.py")).expect("read output");
+    assert!(out_file.contains("from_flag"));
+    assert!(out_file.contains("flag_user"));
+    assert!(!out_file.contains("from_config"));
+
+    let saved = fs::read_to_string(app_dir.join("mapping.json")).expect("saved config mapping");
+    assert!(saved.contains("from_flag"));
+    assert!(saved.contains("flag_user"));
+}
+
+#[test]
+fn tui_mode_smoke_test_works_with_piped_input() {
+    let src = tempdir().expect("src");
+    let out = tempdir().expect("out");
+    let cfg = tempdir().expect("cfg");
+    fs::write(
+        src.path().join("main.py"),
+        "def freeze(user_id):
+    return user_id
+",
+    )
+    .expect("write src");
+
+    let config_dir = cfg.path().join("xdg");
+    let app_dir = config_dir.join("code-obfuscator");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::write(
+        app_dir.join("mapping.json"),
+        r#"{"freeze":"from_tui","user_id":"tui_user"}"#,
+    )
+    .expect("write mapping");
+
+    let input = format!(
+        "1
+{}
+{}
+n
+y
+
+
+n
+",
+        src.path().display(),
+        out.path().display()
+    );
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.arg("--tui")
+        .write_stdin(input)
+        .env("XDG_CONFIG_HOME", &config_dir);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("mapping_input_path="));
+
+    let out_file = fs::read_to_string(out.path().join("main.py")).expect("read output");
+    assert!(out_file.contains("from_tui"));
+    assert!(out_file.contains("tui_user"));
 }
 
 #[test]

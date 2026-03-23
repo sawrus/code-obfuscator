@@ -1,54 +1,8 @@
-# General MCP Prompt Templates (RU / EN)
+# General MCP Prompt Templates (EN)
 
-Ниже 4 готовых шаблона: короткий и длинный на русском и английском.
+Below are two ready-to-use templates: short and long.
 
-## RU — Short
-
-```text
-Работай только через MCP `code_obfuscator`.
-Сделай задачу end-to-end в `root_dir="<ROOT_DIR_MCP>"` с `options.request_id="<REQUEST_ID>"`: `tools/list` -> `list_project_tree` -> `obfuscate_project_from_paths` -> правки только в `obfuscated_files` -> `apply_llm_output` (только измененный subset) -> проверки (test/lint/build) до зелёного.
-Важно: `root_dir` — путь внутри MCP runtime (например, `/workspace/projects/test`), а не путь хоста вида `/Users/...`.
-Нельзя: прямое чтение/запись файлов проекта, `deobfuscate_project*`, клиентские mapping-аргументы.
-При любой ошибке MCP/tool-call остановись и выведи точную ошибку.
-В финале: `applied_files`, что изменено по смыслу, какие проверки запущены и их итог.
-```
-
-## RU — Long
-
-```text
-Работай только через MCP `code_obfuscator`.
-
-Цель: выполнить разработку в проекте `<PROJECT_NAME>` через MCP по циклу анализ -> изменения -> применение -> проверка.
-
-Обязательные правила:
-1) Не читай и не изменяй файлы проекта напрямую.
-2) Используй только MCP-инструменты:
-   - `list_project_tree`
-   - `obfuscate_project_from_paths`
-   - `apply_llm_output`
-3) Не используй `deobfuscate_project*`.
-4) Не передавай клиентские mapping-аргументы.
-5) Используй `root_dir="<ROOT_DIR_MCP>"` (путь внутри MCP runtime, например `/workspace/projects/test`).
-6) Используй один и тот же `options.request_id="<REQUEST_ID>"` для всей задачи.
-7) В `apply_llm_output` передавай только изменённые файлы (subset из `obfuscated_files`).
-8) После каждого применения запускай релевантные проверки (test/lint/build); при падении исправляй и повторяй цикл.
-9) Если MCP недоступен, нет прав записи или tool-call падает — остановись и выведи точную ошибку.
-
-Порядок:
-1) `tools/list`
-2) `list_project_tree(root_dir=...)`
-3) `obfuscate_project_from_paths(root_dir=..., file_paths=[...], options.request_id=...)`
-4) Измени только `obfuscated_files`
-5) `apply_llm_output(root_dir=..., llm_output_files=[...], options.request_id=...)`
-6) Повтори шаги 3-5 при необходимости до зелёных проверок
-
-В финальном ответе покажи:
-- `applied_files`
-- кратко, что изменено по смыслу
-- какие проверки были запущены и их итог.
-```
-
-## EN — Short
+## EN - Short
 
 ```text
 Work only through MCP `code_obfuscator`.
@@ -59,7 +13,7 @@ If any MCP/tool call fails, stop and return the exact error.
 Final output must include: `applied_files`, semantic change summary, executed checks and results.
 ```
 
-## EN — Long
+## EN - Long
 
 ```text
 Work only through MCP `code_obfuscator`.

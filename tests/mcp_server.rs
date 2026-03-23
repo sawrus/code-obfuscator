@@ -156,7 +156,9 @@ fn assert_schema_field_absent(schema: &Value, field: &str) {
 fn assert_schema_requires_request_id(schema: &Value) {
     let required = schema["required"].as_array().expect("schema required");
     assert!(
-        required.iter().any(|value| value.as_str() == Some("options")),
+        required
+            .iter()
+            .any(|value| value.as_str() == Some("options")),
         "schema does not require options: {schema}"
     );
     let options = &schema["properties"]["options"];
@@ -212,7 +214,9 @@ fn mcp_roundtrip_obfuscate_then_deobfuscate() {
     let payload: Value = serde_json::from_str(text).expect("parse tool result");
 
     let obf_files = payload["obfuscated_files"].clone();
-    let obf_content = obf_files[0]["content"].as_str().expect("obfuscated content");
+    let obf_content = obf_files[0]["content"]
+        .as_str()
+        .expect("obfuscated content");
     assert!(obf_content.contains("x_run"), "{payload}");
 
     send_request(
@@ -534,8 +538,14 @@ fn mcp_apply_llm_output_requires_request_id_and_does_not_write() {
 
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("options.request_id is required"), "{response}");
-    assert!(!project.join("app/query.py").exists(), "apply should not write without request_id");
+    assert!(
+        error.contains("options.request_id is required"),
+        "{response}"
+    );
+    assert!(
+        !project.join("app/query.py").exists(),
+        "apply should not write without request_id"
+    );
 
     drop(stdin);
     let _ = child.wait();
@@ -571,7 +581,10 @@ fn mcp_deobfuscate_project_requires_request_id() {
 
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("options.request_id is required"), "{response}");
+    assert!(
+        error.contains("options.request_id is required"),
+        "{response}"
+    );
 
     drop(stdin);
     let _ = child.wait();
@@ -611,7 +624,10 @@ fn mcp_deobfuscate_project_rejects_unknown_request_id() {
         }),
     );
     let obfuscate_response = read_response(&mut stdout);
-    assert!(obfuscate_response.get("error").is_none(), "{obfuscate_response}");
+    assert!(
+        obfuscate_response.get("error").is_none(),
+        "{obfuscate_response}"
+    );
 
     send_request(
         &mut stdin,
@@ -1173,7 +1189,10 @@ fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
     );
 
     let obfuscate_response = read_response(&mut stdout);
-    assert!(obfuscate_response.get("error").is_none(), "{obfuscate_response}");
+    assert!(
+        obfuscate_response.get("error").is_none(),
+        "{obfuscate_response}"
+    );
     let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
         .as_str()
         .expect("text payload");
@@ -1398,7 +1417,10 @@ fn mcp_deobfuscate_uses_stored_request_mapping() {
     );
 
     let obfuscate_response = read_response(&mut stdout);
-    assert!(obfuscate_response.get("error").is_none(), "{obfuscate_response}");
+    assert!(
+        obfuscate_response.get("error").is_none(),
+        "{obfuscate_response}"
+    );
     let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
         .as_str()
         .expect("text payload");
@@ -1474,7 +1496,10 @@ fn mcp_deobfuscate_fails_fast_on_missing_tokens() {
     );
 
     let obfuscate_response = read_response(&mut stdout);
-    assert!(obfuscate_response.get("error").is_none(), "{obfuscate_response}");
+    assert!(
+        obfuscate_response.get("error").is_none(),
+        "{obfuscate_response}"
+    );
     let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
         .as_str()
         .expect("text payload");

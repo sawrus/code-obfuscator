@@ -62,35 +62,13 @@ code-obfuscator
 
 ## MCP Quick Start
 
-### build
+### Build
 
 ```bash
 make mcp-docker-build
 ```
 
-### codex (stdio)
-
-Register MCP server in Codex:
-
-```bash
-codex mcp remove code_obfuscator >/dev/null 2>&1 || true
-PROJECTS_HOST_DIR="${MCP_PROJECTS_HOST_DIR:-$HOME/projects}"
-CONTAINER_NAME="${CONTAINER_NAME:-code-obfuscator-mcp}"
-codex mcp add code_obfuscator -- \
-  docker run --rm -i --name "$CONTAINER_NAME" \
-  -e MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json \
-  -e MCP_LOG_STDOUT=false \
-  -v "$HOME/mcp/code-obfuscator/mapping.default.json:/data/mapping.default.json:ro" \
-  -v "$PROJECTS_HOST_DIR:/workspace/projects:rw" \
-  code-obfuscator-mcp:local
-```
-
-This command only saves the MCP configuration. It does not start the container immediately.
-Codex launches the stdio server on first MCP use.
-
-### codex (http)
-
-1. Start the HTTP MCP server:
+### Start the HTTP MCP server
 
 ```bash
 MCP_HTTP_ADDR=127.0.0.1:18787 \
@@ -99,7 +77,7 @@ MCP_DEFAULT_MAPPING_PATH=$HOME/mcp/code-obfuscator/mapping.default.json \
 ./scripts/run-mcp-docker.sh
 ```
 
-2. Register the HTTP endpoint in Codex:
+### Register the HTTP endpoint in Codex
 
 ```bash
 codex mcp remove code_obfuscator >/dev/null 2>&1 || true
@@ -110,10 +88,16 @@ For `http`, Codex connects to the already running endpoint. Unlike `stdio`, Code
 
 `MCP_PROJECTS_HOST_DIR` maps to `-v "<ABS_PATH>:/workspace/projects:rw"` inside Docker.
 
-### health check
+### Health Check
 
 ```bash
 curl -i http://127.0.0.1:18787/health
+```
+
+### Prompt
+
+```text
+Работай только через MCP `code_obfuscator`. Задача: найди проект, чей runtime path внутри `/workspace/projects/x/y` содержит `z-api`, затем прочитай `query_v2.py` из этого проекта и выведи SQL-скрипты, которые в нем хранятся.
 ```
 
 ## Detailed Documentation

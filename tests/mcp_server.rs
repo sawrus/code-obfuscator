@@ -1,7 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -16,40 +15,6 @@ fn send_request(stdin: &mut impl Write, req: &Value) {
     stdin.write_all(header.as_bytes()).expect("write header");
     stdin.write_all(&body).expect("write body");
     stdin.flush().expect("flush");
-}
-
-fn send_request_json_line(stdin: &mut impl Write, req: &Value) {
-    let body = serde_json::to_string(req).expect("serialize req");
-    stdin.write_all(body.as_bytes()).expect("write body");
-    stdin.write_all(b"\n").expect("write newline");
-    stdin.flush().expect("flush");
-}
-
-fn send_request_json_stream(stdin: &mut impl Write, req: &Value) {
-    let body = serde_json::to_string(req).expect("serialize req");
-    stdin.write_all(body.as_bytes()).expect("write body");
-    stdin.flush().expect("flush");
-}
-
-fn send_request_lowercase_header(stdin: &mut impl Write, req: &Value) {
-    let body = serde_json::to_vec(req).expect("serialize req");
-    let header = format!("content-length: {}\r\n\r\n", body.len());
-    stdin.write_all(header.as_bytes()).expect("write header");
-    stdin.write_all(&body).expect("write body");
-    stdin.flush().expect("flush");
-}
-
-fn read_response_json_line(stdout: &mut impl Read) -> Value {
-    let mut line = Vec::new();
-    let mut buf = [0_u8; 1];
-    loop {
-        stdout.read_exact(&mut buf).expect("read byte");
-        if buf[0] == b'\n' {
-            break;
-        }
-        line.push(buf[0]);
-    }
-    serde_json::from_slice(&line).expect("parse response")
 }
 
 fn read_response(stdout: &mut impl Read) -> Value {
@@ -77,6 +42,36 @@ fn read_response(stdout: &mut impl Read) -> Value {
     serde_json::from_slice(&body).expect("parse response")
 }
 
+fn call_tool(
+    stdin: &mut impl Write,
+    stdout: &mut impl Read,
+    id: i64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    send_request(
+        stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{
+                "name":name,
+                "arguments":arguments
+            }
+        }),
+    );
+    read_response(stdout)
+}
+
+fn parse_tool_payload(resp: &Value) -> Value {
+    assert!(resp.get("error").is_none(), "{resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    serde_json::from_str(text).expect("tool payload")
+}
+
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
     listener.local_addr().expect("local addr").port()
@@ -87,14 +82,17 @@ fn http_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock")
 }
 
-fn wait_http_ready(addr: &str) {
+fn wait_http_ready(child: &mut Child, addr: &str) -> bool {
     for _ in 0..40 {
         if TcpStream::connect(addr).is_ok() {
-            return;
+            return true;
+        }
+        if child.try_wait().expect("poll http child").is_some() {
+            return false;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("http server did not become ready: {addr}");
+    false
 }
 
 fn http_request(addr: &str, method: &str, path: &str, body: Option<&str>) -> String {
@@ -124,7 +122,7 @@ fn http_status_and_json(resp: &str) -> (u16, Value) {
     let body_json = if body.trim().is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(body).expect("parse http json body")
+        serde_json::from_str(body).expect("parse body json")
     };
     (status, body_json)
 }
@@ -134,591 +132,11 @@ fn kill_and_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn read_log(dir: &Path) -> String {
-    fs::read_to_string(dir.join("mcp-server.log")).expect("read mcp log")
-}
-
 fn find_tool<'a>(tools: &'a [Value], name: &str) -> &'a Value {
     tools
         .iter()
         .find(|tool| tool["name"] == name)
         .unwrap_or_else(|| panic!("tool {name} not found: {tools:?}"))
-}
-
-fn assert_schema_field_absent(schema: &Value, field: &str) {
-    let properties = schema["properties"].as_object().expect("schema properties");
-    assert!(
-        !properties.contains_key(field),
-        "schema unexpectedly exposes field {field}: {schema}"
-    );
-}
-
-fn assert_schema_requires_request_id(schema: &Value) {
-    let required = schema["required"].as_array().expect("schema required");
-    assert!(
-        required
-            .iter()
-            .any(|value| value.as_str() == Some("options")),
-        "schema does not require options: {schema}"
-    );
-    let options = &schema["properties"]["options"];
-    let options_required = options["required"].as_array().expect("options required");
-    assert!(
-        options_required
-            .iter()
-            .any(|value| value.as_str() == Some("request_id")),
-        "schema does not require options.request_id: {schema}"
-    );
-}
-
-#[test]
-fn mcp_roundtrip_obfuscate_then_deobfuscate() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("src")).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"src/main.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"roundtrip-1"}
-                }
-            }
-        }),
-    );
-    let obf_response = read_response(&mut stdout);
-    assert!(obf_response.get("error").is_none(), "{obf_response}");
-
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-
-    let obf_files = payload["obfuscated_files"].clone();
-    let obf_content = obf_files[0]["content"]
-        .as_str()
-        .expect("obfuscated content");
-    assert!(obf_content.contains("x_run"), "{payload}");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"apply_llm_output",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "llm_output_files": obf_files,
-                    "options":{"request_id":"roundtrip-1"}
-                }
-            }
-        }),
-    );
-    let rev_response = read_response(&mut stdout);
-    assert!(rev_response.get("error").is_none(), "{rev_response}");
-
-    let rev_text = rev_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("rev text payload");
-    let restored: Value = serde_json::from_str(rev_text).expect("restored payload");
-    let first_path = restored["applied_files"][0].as_str().expect("applied path");
-
-    assert_eq!(first_path, "src/main.py", "{restored}");
-    let applied = fs::read_to_string(project.join("src/main.py")).expect("applied file");
-    assert!(applied.contains("run_order"), "{applied}");
-    assert!(applied.contains("order_id"), "{applied}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_apply_llm_output_accepts_subset_of_obfuscated_files() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("app")).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[
-                        {"path":"app/query.py","content":"QUERY = \"select * from bs.users\"\n"},
-                        {"path":"app/readme.txt","content":"hello world\n"}
-                    ],
-                    "options":{"request_id":"subset-apply-1"}
-                }
-            }
-        }),
-    );
-    let obf_response = read_response(&mut stdout);
-    assert!(obf_response.get("error").is_none(), "{obf_response}");
-
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-    let query_file = payload["obfuscated_files"]
-        .as_array()
-        .expect("obfuscated files")
-        .iter()
-        .find(|file| file["path"] == "app/query.py")
-        .cloned()
-        .expect("query file")
-        .as_object()
-        .cloned()
-        .expect("query file object");
-
-    let mut query_file = Value::Object(query_file);
-    query_file["content"] = Value::String(
-        query_file["content"]
-            .as_str()
-            .expect("content")
-            .replace("select *", "select id"),
-    );
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"apply_llm_output",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "llm_output_files": [query_file],
-                    "options":{"request_id":"subset-apply-1"}
-                }
-            }
-        }),
-    );
-    let apply_response = read_response(&mut stdout);
-    assert!(apply_response.get("error").is_none(), "{apply_response}");
-
-    let apply_text = apply_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("apply text payload");
-    let applied: Value = serde_json::from_str(apply_text).expect("applied payload");
-    assert_eq!(
-        applied["applied_files"],
-        json!(["app/query.py"]),
-        "{applied}"
-    );
-
-    let query = fs::read_to_string(project.join("app/query.py")).expect("query file");
-    assert!(query.contains("select id from bs.users"), "{query}");
-    assert!(
-        !project.join("app/readme.txt").exists(),
-        "readme should not be written on subset apply"
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_apply_llm_output_rejects_unknown_subset_paths() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(&project).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":4,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"app/query.py","content":"select 1 from bs.users\n"}],
-                    "options":{"request_id":"unknown-subset-1"}
-                }
-            }
-        }),
-    );
-    let obf_response = read_response(&mut stdout);
-    assert!(obf_response.get("error").is_none(), "{obf_response}");
-
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-    let obfuscated_files = payload["obfuscated_files"].clone();
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":5,
-            "method":"tools/call",
-            "params":{
-                "name":"apply_llm_output",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "llm_output_files":[{"path":"other.py","content":"print('x')"}],
-                    "options":{"request_id":"unknown-subset-1"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown file path"), "{response}");
-    assert!(
-        obfuscated_files[0]["content"]
-            .as_str()
-            .expect("obfuscated content")
-            .contains("mmm"),
-        "{payload}"
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_apply_llm_output_fails_when_returned_file_loses_required_token() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("app")).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":6,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"app/query.py","content":"select * from bs.users\n"}],
-                    "options":{"request_id":"lost-token-1"}
-                }
-            }
-        }),
-    );
-    let obf_response = read_response(&mut stdout);
-    assert!(obf_response.get("error").is_none(), "{obf_response}");
-
-    let text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("parse tool result");
-    let obfuscated = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content");
-    assert!(obfuscated.contains("mmm"), "{payload}");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":7,
-            "method":"tools/call",
-            "params":{
-                "name":"apply_llm_output",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "llm_output_files":[{"path":"app/query.py","content":"select * from users\n"}],
-                    "options":{"request_id":"lost-token-1"}
-                }
-            }
-        }),
-    );
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("missing in LLM output for file 'app/query.py'"),
-        "{response}"
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_apply_llm_output_requires_request_id_and_does_not_write() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(&project).expect("mkdirs");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":8,
-            "method":"tools/call",
-            "params":{
-                "name":"apply_llm_output",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "llm_output_files":[{"path":"app/query.py","content":"print('x')"}]
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("options.request_id is required"),
-        "{response}"
-    );
-    assert!(
-        !project.join("app/query.py").exists(),
-        "apply should not write without request_id"
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_deobfuscate_project_requires_request_id() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":9,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content":"print('x')"}]
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("options.request_id is required"),
-        "{response}"
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_deobfuscate_project_rejects_unknown_request_id() {
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":14,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"known-request"}
-                }
-            }
-        }),
-    );
-    let obfuscate_response = read_response(&mut stdout);
-    assert!(
-        obfuscate_response.get("error").is_none(),
-        "{obfuscate_response}"
-    );
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":15,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content":"def x_run(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"unknown-request"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown request_id"), "{response}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_rejects_unknown_message_payload_field() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":16,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"a.py","content":"print('x')"}],
-                    "message_payload":{"unexpected":"field"},
-                    "options":{"request_id":"reject-unknown-field"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown field"), "{response}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_stdio_handshake_works_with_default_logging_config() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":900,
-            "method":"initialize",
-            "params":{}
-        }),
-    );
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    assert_eq!(
-        response["result"]["serverInfo"]["name"].as_str(),
-        Some("code-obfuscator-mcp")
-    );
-
-    drop(stdin);
-    let _ = child.wait();
 }
 
 #[test]
@@ -733,7 +151,7 @@ fn mcp_initialize_echoes_client_protocol_version() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
 
-    send_request_json_stream(
+    send_request(
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
@@ -742,7 +160,7 @@ fn mcp_initialize_echoes_client_protocol_version() {
             "params":{"protocolVersion":"2025-11-25"}
         }),
     );
-    let response = read_response_json_line(&mut stdout);
+    let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(
         response["result"]["protocolVersion"].as_str(),
@@ -769,7 +187,7 @@ fn mcp_resources_endpoints_return_empty_lists() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":904,
+            "id":1,
             "method":"resources/list",
             "params":{}
         }),
@@ -788,7 +206,7 @@ fn mcp_resources_endpoints_return_empty_lists() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":905,
+            "id":2,
             "method":"resources/templates/list",
             "params":{}
         }),
@@ -808,157 +226,8 @@ fn mcp_resources_endpoints_return_empty_lists() {
 }
 
 #[test]
-fn mcp_tools_list_hides_client_mapping_payloads_and_requires_request_id() {
+fn mcp_tools_list_exposes_git_style_tools_only() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":9040,
-            "method":"tools/list",
-            "params":{}
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let tools = response["result"]["tools"].as_array().expect("tools array");
-
-    let obfuscate = find_tool(tools, "obfuscate_project");
-    let obfuscate_from_paths = find_tool(tools, "obfuscate_project_from_paths");
-    let apply = find_tool(tools, "apply_llm_output");
-    let deobfuscate = find_tool(tools, "deobfuscate_project");
-    let deobfuscate_from_paths = find_tool(tools, "deobfuscate_project_from_paths");
-
-    assert_schema_field_absent(&obfuscate["inputSchema"], "manual_mapping");
-    assert_schema_field_absent(&obfuscate_from_paths["inputSchema"], "manual_mapping");
-    assert_schema_field_absent(&apply["inputSchema"], "mapping_payload");
-    assert_schema_field_absent(&deobfuscate["inputSchema"], "mapping_payload");
-    assert_schema_field_absent(&deobfuscate_from_paths["inputSchema"], "mapping_payload");
-
-    assert_schema_requires_request_id(&obfuscate["inputSchema"]);
-    assert_schema_requires_request_id(&obfuscate_from_paths["inputSchema"]);
-    assert_schema_requires_request_id(&apply["inputSchema"]);
-    assert_schema_requires_request_id(&deobfuscate["inputSchema"]);
-    assert_schema_requires_request_id(&deobfuscate_from_paths["inputSchema"]);
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_stdio_accepts_lowercase_content_length_header() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request_lowercase_header(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":901,
-            "method":"initialize",
-            "params":{}
-        }),
-    );
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    assert_eq!(
-        response["result"]["serverInfo"]["name"].as_str(),
-        Some("code-obfuscator-mcp")
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_stdio_accepts_json_line_protocol() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request_json_line(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":902,
-            "method":"initialize",
-            "params":{}
-        }),
-    );
-    let response = read_response_json_line(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    assert_eq!(
-        response["result"]["serverInfo"]["name"].as_str(),
-        Some("code-obfuscator-mcp")
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_stdio_accepts_json_stream_without_newline() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request_json_stream(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":903,
-            "method":"initialize",
-            "params":{}
-        }),
-    );
-    let response = read_response_json_line(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    assert_eq!(
-        response["result"]["serverInfo"]["name"].as_str(),
-        Some("code-obfuscator-mcp")
-    );
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_uses_default_mapping_when_manual_not_provided() {
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -973,573 +242,60 @@ fn mcp_uses_default_mapping_when_manual_not_provided() {
         &json!({
             "jsonrpc":"2.0",
             "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"src/main.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"default-map-1"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let obf_content = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("content");
-    assert!(obf_content.contains("x_run"), "{payload}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_obfuscate_enrich_detected_terms_opt_in() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":31,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"q.sql","content":"select 1 from users where id = 1"}],
-                    "options":{"request_id":"enrich-1","enrich_detected_terms": true}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let obfuscated = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content");
-    assert!(!obfuscated.contains("users"), "{payload}");
-    assert!(obfuscated.contains("sql_table_"), "{payload}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_list_project_tree_returns_directory_structure() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("app/sql")).expect("mkdirs");
-    fs::write(project.join("app/sql/query.py"), "print('ok')").expect("write file");
-    fs::write(project.join("README.md"), "# demo").expect("write file");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":40,
-            "method":"tools/call",
-            "params":{
-                "name":"list_project_tree",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "max_depth": 5
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let entries = payload["entries"].as_array().expect("entries");
-    let paths = entries
-        .iter()
-        .filter_map(|e| e["path"].as_str())
-        .collect::<Vec<_>>();
-    assert!(paths.contains(&"app/sql/query.py"), "{payload}");
-    assert!(paths.contains(&"app/sql"), "{payload}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_obfuscate_project_from_paths_reads_files_in_mcp() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("app")).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-    fs::write(
-        project.join("app/query.py"),
-        "QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n",
-    )
-    .expect("write file");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":41,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project_from_paths",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "file_paths":["app/query.py"],
-                    "options":{"request_id":"paths-obfuscate-1"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let content = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("content");
-    assert!(content.contains("select 1 from mmm.users"), "{payload}");
-    assert!(content.contains("mmm_user_ids"), "{payload}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_deobfuscate_project_from_paths_reads_files_in_mcp() {
-    let dir = tempdir().expect("tmp");
-    let project = dir.path().join("project");
-    fs::create_dir_all(project.join("app")).expect("mkdirs");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":42,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"app/query.py","content":"QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n"}],
-                    "options":{"request_id":"paths-deobfuscate-1"}
-                }
-            }
-        }),
-    );
-
-    let obfuscate_response = read_response(&mut stdout);
-    assert!(
-        obfuscate_response.get("error").is_none(),
-        "{obfuscate_response}"
-    );
-    let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let obfuscate_payload: Value = serde_json::from_str(obfuscate_text).expect("payload json");
-    let obfuscated_content = obfuscate_payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("content")
-        .to_string();
-    fs::write(project.join("app/query.py"), &obfuscated_content).expect("write obfuscated file");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":43,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project_from_paths",
-                "arguments":{
-                    "root_dir": project.to_string_lossy().to_string(),
-                    "file_paths":["app/query.py"],
-                    "options":{"request_id":"paths-deobfuscate-1"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let content = payload["restored_files"][0]["content"]
-        .as_str()
-        .expect("content");
-    assert!(content.contains("select 1 from bs.users"), "{payload}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_direct_deobfuscation_disabled_by_default() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":420,
             "method":"tools/list",
             "params":{}
         }),
     );
-    let list_response = read_response(&mut stdout);
-    assert!(list_response.get("error").is_none(), "{list_response}");
-    let tools = list_response["result"]["tools"]
-        .as_array()
-        .expect("tools array");
-    assert!(
-        tools.iter().all(|t| t["name"] != "deobfuscate_project"),
-        "{list_response}"
-    );
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":421,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content":"print('x')"}]
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("disabled"), "{response}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn mcp_http_updates_default_mapping() {
-    let _guard = http_test_lock();
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, "{}").expect("init mapping");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_HTTP_ADDR", &addr)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    wait_http_ready(&addr);
-
-    let resp = http_request(
-        &addr,
-        "PUT",
-        "/mapping",
-        Some(r#"{"mapping":{"run_order":"x_run"}}"#),
-    );
-    let (status, _) = http_status_and_json(&resp);
-    assert_eq!(status, 200, "{resp}");
-
-    let saved = fs::read_to_string(&mapping_path).expect("saved mapping");
-    assert!(saved.contains("run_order"), "{saved}");
-
-    kill_and_wait(&mut child);
-}
-
-#[test]
-fn mcp_http_jsonrpc_over_root_and_mcp_path() {
-    let _guard = http_test_lock();
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_HTTP_ADDR", &addr)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    wait_http_ready(&addr);
-
-    let init_body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
-    let init_resp = http_request(&addr, "POST", "/", Some(&init_body.to_string()));
-    let (init_status, init_json) = http_status_and_json(&init_resp);
-    assert_eq!(init_status, 200, "{init_resp}");
-    assert_eq!(
-        init_json["result"]["serverInfo"]["name"].as_str(),
-        Some("code-obfuscator-mcp")
-    );
-
-    let tool_body = json!({
-        "jsonrpc":"2.0",
-        "id":2,
-        "method":"tools/call",
-        "params":{
-            "name":"obfuscate_project",
-            "arguments":{
-                "project_files":[{"path":"query.py","content":"QUERY_1 = \"\"\"\nselect 1 from bs.users u where u.id in %(bs_user_ids)s\n\"\"\"\n"}],
-                "options":{"request_id":"http-1"}
-            }
-        }
-    });
-    let tool_resp = http_request(&addr, "POST", "/mcp", Some(&tool_body.to_string()));
-    let (tool_status, tool_json) = http_status_and_json(&tool_resp);
-    assert_eq!(tool_status, 200, "{tool_resp}");
-
-    let text = tool_json["result"]["content"][0]["text"]
-        .as_str()
-        .expect("tool result text");
-    let payload: Value = serde_json::from_str(text).expect("tool payload");
-    let content = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content");
-    assert!(content.contains("select 1 from mmm.users"), "{payload}");
-    assert!(!content.contains("py_var_"), "{payload}");
-
-    kill_and_wait(&mut child);
-}
-
-#[test]
-fn mcp_deobfuscate_uses_stored_request_mapping() {
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
-
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":11,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"stored-map-1"}
-                }
-            }
-        }),
-    );
-
-    let obfuscate_response = read_response(&mut stdout);
-    assert!(
-        obfuscate_response.get("error").is_none(),
-        "{obfuscate_response}"
-    );
-    let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(obfuscate_text).expect("payload json");
-    let obfuscated_content = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content")
-        .to_string();
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":12,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content": obfuscated_content}],
-                    "options":{"request_id":"stored-map-1"}
-                }
-            }
-        }),
-    );
 
     let response = read_response(&mut stdout);
     assert!(response.get("error").is_none(), "{response}");
-    let text = response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(text).expect("payload json");
-    let restored = payload["restored_files"][0]["content"]
-        .as_str()
-        .expect("restored content");
-    assert!(restored.contains("run_order"), "{payload}");
 
-    drop(stdin);
-    let _ = child.wait();
-}
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
 
-#[test]
-fn mcp_deobfuscate_fails_fast_on_missing_tokens() {
-    let dir = tempdir().expect("tmp");
-    let mapping_path = dir.path().join("mapping.default.json");
-    fs::write(&mapping_path, r#"{"run_order":"x_run"}"#).expect("write mapping");
+    assert!(names.contains(&"ls_tree"), "{response}");
+    assert!(names.contains(&"ls_files"), "{response}");
+    assert!(names.contains(&"pull"), "{response}");
+    assert!(names.contains(&"clone"), "{response}");
+    assert!(names.contains(&"status"), "{response}");
+    assert!(names.contains(&"push"), "{response}");
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":10,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"missing-token-1"}
-                }
-            }
-        }),
-    );
-
-    let obfuscate_response = read_response(&mut stdout);
+    assert!(!names.contains(&"list_project_tree"), "{response}");
+    assert!(!names.contains(&"obfuscate_project"), "{response}");
     assert!(
-        obfuscate_response.get("error").is_none(),
-        "{obfuscate_response}"
+        !names.contains(&"obfuscate_project_from_paths"),
+        "{response}"
     );
-    let obfuscate_text = obfuscate_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("text payload");
-    let payload: Value = serde_json::from_str(obfuscate_text).expect("payload json");
-    let obfuscated_content = payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content")
-        .to_string();
+    assert!(!names.contains(&"apply_llm_output"), "{response}");
+    assert!(!names.contains(&"deobfuscate_project"), "{response}");
 
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":13,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content": obfuscated_content.replace("x_run", "missing_token")}],
-                    "options":{"request_id":"missing-token-1"}
-                }
-            }
-        }),
+    let pull = find_tool(tools, "pull");
+    assert!(
+        pull["inputSchema"]["properties"]["options"]["required"]
+            .as_array()
+            .expect("options required")
+            .iter()
+            .any(|value| value.as_str() == Some("request_id")),
+        "{pull}"
     );
-
-    let response = read_response(&mut stdout);
-    let error_text = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error_text.contains("fail-fast"), "{response}");
 
     drop(stdin);
     let _ = child.wait();
 }
 
 #[test]
-fn mcp_logs_stdio_requests_and_responses() {
+fn mcp_ls_tree_and_ls_files_respect_hidden_and_truncation() {
     let dir = tempdir().expect("tmp");
-    let log_dir = dir.path().join("logs");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/a.py"), "print('a')\n").expect("write");
+    fs::write(project.join("app/b.py"), "print('b')\n").expect("write");
+    fs::write(project.join(".secret.py"), "print('secret')\n").expect("write");
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_LOG_DIR", &log_dir)
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1549,69 +305,113 @@ fn mcp_logs_stdio_requests_and_responses() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
 
-    send_request(
+    let ls_tree_small = call_tool(
         &mut stdin,
-        &json!({"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}),
+        &mut stdout,
+        4,
+        "ls_tree",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "max_entries": 1
+        }),
     );
-    let _ = read_response(&mut stdout);
+    let tree_payload_small = parse_tool_payload(&ls_tree_small);
+    assert_eq!(tree_payload_small["truncated"].as_bool(), Some(true));
+    let entries_small = tree_payload_small["entries"].as_array().expect("entries");
+    assert_eq!(entries_small.len(), 1, "{tree_payload_small}");
+
+    let ls_files_default = call_tool(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "ls_files",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "max_entries": 1
+        }),
+    );
+    let files_payload_default = parse_tool_payload(&ls_files_default);
+    assert_eq!(files_payload_default["truncated"].as_bool(), Some(true));
+    let files_default = files_payload_default["files"].as_array().expect("files");
+    assert_eq!(files_default.len(), 1, "{files_payload_default}");
+    assert!(
+        files_default.iter().all(|item| {
+            !item
+                .as_str()
+                .unwrap_or_default()
+                .split('/')
+                .any(|part| part.starts_with('.'))
+        }),
+        "{files_payload_default}"
+    );
+
+    let ls_files_hidden = call_tool(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "ls_files",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "include_hidden": true,
+            "max_entries": 20
+        }),
+    );
+    let files_payload_hidden = parse_tool_payload(&ls_files_hidden);
+    let files_hidden = files_payload_hidden["files"].as_array().expect("files");
+    assert!(
+        files_hidden
+            .iter()
+            .any(|item| item.as_str() == Some(".secret.py")),
+        "{files_payload_hidden}"
+    );
+    assert_eq!(files_payload_hidden["truncated"].as_bool(), Some(false));
 
     drop(stdin);
     let _ = child.wait();
-
-    let log = read_log(&log_dir);
-    assert!(log.contains("\"transport\":\"stdio\""), "{log}");
-    assert!(log.contains("\"direction\":\"request\""), "{log}");
-    assert!(log.contains("\"direction\":\"response\""), "{log}");
 }
 
 #[test]
-fn mcp_logs_http_requests_and_responses() {
-    let _guard = http_test_lock();
-    let dir = tempdir().expect("tmp");
-    let log_dir = dir.path().join("logs");
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
+fn mcp_legacy_tool_names_are_rejected() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_HTTP_ADDR", &addr)
-        .env("MCP_LOG_DIR", &log_dir)
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn server");
 
-    wait_http_ready(&addr);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
 
-    let health_resp = http_request(&addr, "GET", "/health", None);
-    let (health_status, _) = http_status_and_json(&health_resp);
-    assert_eq!(health_status, 200, "{health_resp}");
+    let response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        10,
+        "obfuscate_project",
+        json!({
+            "project_files":[{"path":"a.py","content":"print('x')"}],
+            "options":{"request_id":"legacy-1"}
+        }),
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("unknown or disabled tool"), "{response}");
 
-    let init_body = json!({"jsonrpc":"2.0","id":201,"method":"initialize","params":{}});
-    let init_resp = http_request(&addr, "POST", "/mcp", Some(&init_body.to_string()));
-    let (init_status, _) = http_status_and_json(&init_resp);
-    assert_eq!(init_status, 200, "{init_resp}");
-
-    kill_and_wait(&mut child);
-
-    let log = read_log(&log_dir);
-    assert!(log.contains("\"transport\":\"http-admin\""), "{log}");
-    assert!(log.contains("\"transport\":\"http-mcp\""), "{log}");
-    assert!(log.contains("\"method\":\"initialize\""), "{log}");
+    drop(stdin);
+    let _ = child.wait();
 }
 
 #[test]
-fn mcp_log_file_rotation() {
+fn mcp_pull_obfuscates_root_dir_subset() {
     let dir = tempdir().expect("tmp");
-    let log_dir = dir.path().join("logs");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+    fs::write(project.join("app/ignore.txt"), "hello\n").expect("write");
+
     let mapping_path = dir.path().join("mapping.default.json");
     fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
-        .env("MCP_LOG_DIR", &log_dir)
-        .env("MCP_LOG_MAX_BYTES", "700")
-        .env("MCP_LOG_MAX_FILES", "2")
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1621,31 +421,304 @@ fn mcp_log_file_rotation() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
 
-    for id in 0..25 {
-        send_request(
-            &mut stdin,
-            &json!({
-                "jsonrpc":"2.0",
-                "id": id,
-                "method":"tools/call",
-                "params":{
-                    "name":"obfuscate_project",
-                    "arguments":{
-                        "project_files":[{"path":"q.sql","content": format!("select 1 from bs.users where name = '{}'", "x".repeat(80))}],
-                        "options":{"request_id":format!("rotation-{id}")}
-                    }
-                }
-            }),
-        );
-        let _ = read_response(&mut stdout);
-    }
+    let response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        11,
+        "pull",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "file_paths": ["app/query.py"],
+            "options": {"request_id":"pull-1"}
+        }),
+    );
+
+    let payload = parse_tool_payload(&response);
+    let files = payload["obfuscated_files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{payload}");
+    assert_eq!(files[0]["path"].as_str(), Some("app/query.py"));
+    assert!(
+        files[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mmm.users"),
+        "{payload}"
+    );
 
     drop(stdin);
     let _ = child.wait();
+}
+
+#[test]
+fn mcp_clone_writes_full_obfuscated_tree_to_workspace() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    let response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        12,
+        "clone",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"clone-1"}
+        }),
+    );
+
+    let payload = parse_tool_payload(&response);
+    let cloned = payload["cloned_files"].as_array().expect("cloned files");
+    assert!(
+        cloned.iter().any(|f| f.as_str() == Some("app/query.py")),
+        "{payload}"
+    );
+
+    let workspace_file =
+        fs::read_to_string(workspace.join("app/query.py")).expect("workspace file");
+    assert!(workspace_file.contains("mmm.users"), "{workspace_file}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_status_reports_added_modified_deleted() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+    fs::write(project.join("app/remove.py"), "print('remove')\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    let clone_resp = call_tool(
+        &mut stdin,
+        &mut stdout,
+        13,
+        "clone",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"status-1"}
+        }),
+    );
+    assert!(clone_resp.get("error").is_none(), "{clone_resp}");
+
+    let query_path = workspace.join("app/query.py");
+    let query_content = fs::read_to_string(&query_path).expect("query");
+    fs::write(&query_path, query_content.replace("select *", "select id")).expect("rewrite query");
+    fs::remove_file(workspace.join("app/remove.py")).expect("remove tracked file");
+    fs::write(workspace.join("app/new.py"), "print('mmm record')\n").expect("add file");
+
+    let status_resp = call_tool(
+        &mut stdin,
+        &mut stdout,
+        14,
+        "status",
+        json!({
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"status-1"}
+        }),
+    );
+    let payload = parse_tool_payload(&status_resp);
+    assert_eq!(payload["clean"].as_bool(), Some(false), "{payload}");
+
+    let modified = payload["diff"]["modified"].as_array().expect("modified");
+    let added = payload["diff"]["added"].as_array().expect("added");
+    let deleted = payload["diff"]["deleted"].as_array().expect("deleted");
 
     assert!(
-        log_dir.join("mcp-server.log.1").exists(),
-        "rotation file missing in {}",
-        log_dir.display()
+        modified.iter().any(|v| v.as_str() == Some("app/query.py")),
+        "{payload}"
     );
+    assert!(
+        added.iter().any(|v| v.as_str() == Some("app/new.py")),
+        "{payload}"
+    );
+    assert!(
+        deleted.iter().any(|v| v.as_str() == Some("app/remove.py")),
+        "{payload}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_push_applies_add_modify_delete() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+    fs::write(project.join("app/remove.py"), "print('remove')\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    let clone_resp = call_tool(
+        &mut stdin,
+        &mut stdout,
+        15,
+        "clone",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"push-1"}
+        }),
+    );
+    assert!(clone_resp.get("error").is_none(), "{clone_resp}");
+
+    let query_path = workspace.join("app/query.py");
+    let query_content = fs::read_to_string(&query_path).expect("query");
+    fs::write(&query_path, query_content.replace("select *", "select id")).expect("rewrite query");
+    fs::remove_file(workspace.join("app/remove.py")).expect("remove tracked file");
+    fs::write(workspace.join("app/new.py"), "print('mmm created')\n").expect("add file");
+
+    let push_resp = call_tool(
+        &mut stdin,
+        &mut stdout,
+        16,
+        "push",
+        json!({
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"push-1"}
+        }),
+    );
+
+    let payload = parse_tool_payload(&push_resp);
+    let applied = payload["applied_files"].as_array().expect("applied files");
+    let deleted = payload["deleted_files"].as_array().expect("deleted files");
+
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("app/query.py")),
+        "{payload}"
+    );
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("app/new.py")),
+        "{payload}"
+    );
+    assert!(
+        deleted.iter().any(|v| v.as_str() == Some("app/remove.py")),
+        "{payload}"
+    );
+
+    let query_source = fs::read_to_string(project.join("app/query.py")).expect("source query");
+    assert!(
+        query_source.contains("select id from bs.users"),
+        "{query_source}"
+    );
+
+    let new_source = fs::read_to_string(project.join("app/new.py")).expect("new source");
+    assert!(new_source.contains("bs created"), "{new_source}");
+
+    assert!(
+        !project.join("app/remove.py").exists(),
+        "removed file must not exist after push"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_http_jsonrpc_supports_new_pull_tool() {
+    let _guard = http_test_lock();
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+    let (addr, mut child) = (0..8)
+        .find_map(|_| {
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
+            let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+                .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+                .env("MCP_HTTP_ADDR", &addr)
+                .env("MCP_LOG_STDOUT", "false")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn server");
+            if wait_http_ready(&mut child, &addr) {
+                Some((addr, child))
+            } else {
+                kill_and_wait(&mut child);
+                None
+            }
+        })
+        .expect("start http server on a free port");
+
+    let body = json!({
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"tools/call",
+        "params":{
+            "name":"pull",
+            "arguments":{
+                "root_dir": project.to_string_lossy().to_string(),
+                "file_paths":["app/query.py"],
+                "options":{"request_id":"http-pull-1"}
+            }
+        }
+    });
+
+    let resp = http_request(&addr, "POST", "/mcp", Some(&body.to_string()));
+    let (status, json_body) = http_status_and_json(&resp);
+    assert_eq!(status, 200, "{resp}");
+
+    let text = json_body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let payload: Value = serde_json::from_str(text).expect("payload");
+    let content = payload["obfuscated_files"][0]["content"]
+        .as_str()
+        .expect("content");
+    assert!(content.contains("mmm.users"), "{payload}");
+
+    kill_and_wait(&mut child);
 }

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Code Obfuscator"
-  short_description: "Obfuscate code and verify reversible mappings"
-  default_prompt: "Use $code-obfuscator to obfuscate a source tree, manage mapping files, and validate reverse restoration."

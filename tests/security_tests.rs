@@ -5,7 +5,14 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use serde_json::{Value, json};
+#[cfg(unix)]
+use tempfile::tempdir;
 
 fn send_request(stdin: &mut impl Write, req: &Value) {
     let body = serde_json::to_vec(req).expect("serialize req");
@@ -85,9 +92,10 @@ fn hmac_signature_requires_secret_key_env_var() {
             "id":1,
             "method":"tools/call",
             "params":{
-                "name":"obfuscate_project",
+                "name":"pull",
                 "arguments":{
-                    "project_files":[{"path":"src/main.py","content":"def run_order(order_id):\n    return order_id\n"}],
+                    "root_dir":"/tmp",
+                    "file_paths":[],
                     "options":{"request_id":"sec-sign-no-key","security":{"sign_mapping":true}}
                 }
             }
@@ -97,73 +105,6 @@ fn hmac_signature_requires_secret_key_env_var() {
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(error.contains("MAPPING_SECRET_KEY"), "{response}");
-
-    drop(stdin);
-    let _ = child.wait();
-}
-
-#[test]
-fn deobfuscate_rejects_client_supplied_mapping_payload_tampering_attempt() {
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
-        .env("MCP_ALLOW_DIRECT_DEOBFUSCATION", "true")
-        .env("MAPPING_SECRET_KEY", "test-signing-key")
-        .env("MCP_LOG_STDOUT", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn server");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = child.stdout.take().expect("stdout");
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{
-                "name":"obfuscate_project",
-                "arguments":{
-                    "project_files":[{"path":"a.py","content":"def run_order(order_id):\n    return order_id\n"}],
-                    "options":{"request_id":"sec-sign-tamper","security":{"sign_mapping":true}}
-                }
-            }
-        }),
-    );
-    let obf_response = read_response(&mut stdout);
-    assert!(obf_response.get("error").is_none(), "{obf_response}");
-
-    let obf_text = obf_response["result"]["content"][0]["text"]
-        .as_str()
-        .expect("obfuscate payload text");
-    let obf_payload: Value = serde_json::from_str(obf_text).expect("parse obfuscate payload");
-    let obfuscated_content = obf_payload["obfuscated_files"][0]["content"]
-        .as_str()
-        .expect("obfuscated content")
-        .to_string();
-
-    send_request(
-        &mut stdin,
-        &json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"deobfuscate_project",
-                "arguments":{
-                    "llm_output_files":[{"path":"a.py","content":obfuscated_content}],
-                    "mapping_payload":{"signature":"bad-signature"},
-                    "options":{"request_id":"sec-sign-tamper"}
-                }
-            }
-        }),
-    );
-
-    let response = read_response(&mut stdout);
-    let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown field"), "{response}");
-    assert!(error.contains("mapping_payload"), "{response}");
 
     drop(stdin);
     let _ = child.wait();
@@ -186,12 +127,13 @@ fn encrypt_mapping_requires_encrypt_key_env_var() {
         &mut stdin,
         &json!({
             "jsonrpc":"2.0",
-            "id":4,
+            "id":2,
             "method":"tools/call",
             "params":{
-                "name":"obfuscate_project",
+                "name":"pull",
                 "arguments":{
-                    "project_files":[{"path":"src/main.py","content":"print('x')\n"}],
+                    "root_dir":"/tmp",
+                    "file_paths":[],
                     "options":{"request_id":"sec-encrypt-no-key","security":{"encrypt_mapping":true}}
                 }
             }
@@ -239,7 +181,7 @@ fn http_rejects_request_body_larger_than_64mb_by_content_length() {
 }
 
 #[test]
-fn obfuscate_rejects_null_byte_in_path() {
+fn pull_rejects_null_byte_in_path() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
@@ -257,10 +199,11 @@ fn obfuscate_rejects_null_byte_in_path() {
             "id":5,
             "method":"tools/call",
             "params":{
-                "name":"obfuscate_project",
+                "name":"pull",
                 "arguments":{
-                    "project_files":[{"path":"src/fo\u{0000}o.py","content":"print('x')\n"}],
-                    "options":{"request_id":"sec-null-byte"}
+                    "root_dir":"/tmp",
+                    "file_paths":["src/ma\u{0000}in.py"],
+                    "options":{"request_id":"null-byte-1"}
                 }
             }
         }),
@@ -268,17 +211,14 @@ fn obfuscate_rejects_null_byte_in_path() {
 
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("null bytes") || error.contains("invalid path"),
-        "{response}"
-    );
+    assert!(error.contains("null bytes"), "{response}");
 
     drop(stdin);
     let _ = child.wait();
 }
 
 #[test]
-fn obfuscate_rejects_request_id_too_long() {
+fn pull_rejects_request_id_too_long() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
@@ -288,6 +228,7 @@ fn obfuscate_rejects_request_id_too_long() {
 
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = child.stdout.take().expect("stdout");
+    let long_id = "x".repeat(257);
 
     send_request(
         &mut stdin,
@@ -296,10 +237,11 @@ fn obfuscate_rejects_request_id_too_long() {
             "id":6,
             "method":"tools/call",
             "params":{
-                "name":"obfuscate_project",
+                "name":"pull",
                 "arguments":{
-                    "project_files":[{"path":"src/main.py","content":"print('x')\n"}],
-                    "options":{"request_id":"x".repeat(300)}
+                    "root_dir":"/tmp",
+                    "file_paths":[],
+                    "options":{"request_id":long_id}
                 }
             }
         }),
@@ -307,17 +249,14 @@ fn obfuscate_rejects_request_id_too_long() {
 
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("exceeds max length") || error.contains("request_id"),
-        "{response}"
-    );
+    assert!(error.contains("exceeds max length"), "{response}");
 
     drop(stdin);
     let _ = child.wait();
 }
 
 #[test]
-fn obfuscate_rejects_parent_traversal_path() {
+fn pull_rejects_parent_traversal_path() {
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
         .env("MCP_LOG_STDOUT", "false")
         .stdin(Stdio::piped())
@@ -335,10 +274,11 @@ fn obfuscate_rejects_parent_traversal_path() {
             "id":7,
             "method":"tools/call",
             "params":{
-                "name":"obfuscate_project",
+                "name":"pull",
                 "arguments":{
-                    "project_files":[{"path":"../secret.txt","content":"hidden\n"}],
-                    "options":{"request_id":"sec-parent-traversal"}
+                    "root_dir":"/tmp",
+                    "file_paths":["../etc/passwd"],
+                    "options":{"request_id":"traversal-1"}
                 }
             }
         }),
@@ -347,6 +287,122 @@ fn obfuscate_rejects_parent_traversal_path() {
     let response = read_response(&mut stdout);
     let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(error.contains("parent traversal"), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn push_requires_existing_request_snapshot() {
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":8,
+            "method":"tools/call",
+            "params":{
+                "name":"push",
+                "arguments":{
+                    "workspace_dir":"/tmp",
+                    "options":{"request_id":"missing-session"}
+                }
+            }
+        }),
+    );
+
+    let response = read_response(&mut stdout);
+    let error = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error.contains("unknown request_id"), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn push_rejects_writing_through_source_symlink() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+    fs::write(project.join("app/target.py"), "print('guard')\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":9,
+            "method":"tools/call",
+            "params":{
+                "name":"clone",
+                "arguments":{
+                    "root_dir":project.to_string_lossy().to_string(),
+                    "workspace_dir":workspace.to_string_lossy().to_string(),
+                    "options":{"request_id":"symlink-write-1"}
+                }
+            }
+        }),
+    );
+    let clone_response = read_response(&mut stdout);
+    assert!(clone_response.get("error").is_none(), "{clone_response}");
+
+    let workspace_query = workspace.join("app/query.py");
+    let content = fs::read_to_string(&workspace_query).expect("read workspace query");
+    fs::write(&workspace_query, content.replace("select *", "select id"))
+        .expect("rewrite workspace query");
+
+    let source_query = project.join("app/query.py");
+    fs::remove_file(&source_query).expect("remove source query");
+    symlink("target.py", &source_query).expect("create source symlink");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":10,
+            "method":"tools/call",
+            "params":{
+                "name":"push",
+                "arguments":{
+                    "workspace_dir":workspace.to_string_lossy().to_string(),
+                    "options":{"request_id":"symlink-write-1"}
+                }
+            }
+        }),
+    );
+    let push_response = read_response(&mut stdout);
+    let error = push_response["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        error.contains("refusing to write through symlink"),
+        "{push_response}"
+    );
 
     drop(stdin);
     let _ = child.wait();

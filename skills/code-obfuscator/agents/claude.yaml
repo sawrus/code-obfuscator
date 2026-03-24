@@ -1,0 +1,22 @@
+name: code-obfuscator-claude
+ide: claude
+mcp_server: code_obfuscator
+required_tools:
+  - ls_tree
+  - ls_files
+  - pull
+  - clone
+  - status
+  - push
+workflow:
+  - ls_tree
+  - clone
+  - status
+  - push
+  - status
+rules:
+  - Keep explicit tool allowlist enabled in MCP connector settings.
+  - Reuse one options.request_id for all calls.
+  - Use runtime paths for MCP calls and host mirror path for direct file edits.
+  - Require clean=false before push and clean=true after push.
+  - Stop on any MCP tool-call error and return exact error message.

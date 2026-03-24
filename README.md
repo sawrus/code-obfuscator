@@ -1,6 +1,7 @@
 # code-obfuscator
 
-MCP server and CLI/TUI utility for safe code obfuscation before LLM usage and reverse application of LLM changes back to your project.
+MCP server and CLI/TUI utility for safe code obfuscation before LLM usage and reverse application of LLM changes back to
+your project.
 
 ## Architecture Diagrams
 
@@ -21,15 +22,6 @@ sequenceDiagram
 ### MCP Case
 
 ```mermaid
-flowchart LR
-    user["User"] --> ide["Agent IDE<br/>e.g. Codex"]
-    ide --> llm["LLM"]
-    ide --> mcp["MCP server<br/>code-obfuscator"]
-    mcp --> project["Project files on disk"]
-    mcp -. "obfuscated_files / llm_output_files" .- llm
-```
-
-```mermaid
 sequenceDiagram
     actor User
     participant IDE as Agent IDE (Codex)
@@ -38,16 +30,16 @@ sequenceDiagram
     participant Project as Project / root_dir
 
     User->>IDE: Request a code change
-    IDE->>MCP: list_project_tree / obfuscate_project_from_paths(..., options.request_id)
-    MCP->>Project: Read selected files
+    IDE->>MCP: ls_tree / pull(..., options.request_id) or clone(..., options.request_id)
+    MCP->>Project: Read source files
     Project-->>MCP: Source files
     MCP-->>IDE: obfuscated_files
     IDE->>LLM: Send obfuscated_files only
     LLM-->>IDE: Return modified obfuscated_files
-    IDE->>MCP: apply_llm_output(root_dir, llm_output_files, options.request_id)
-    MCP->>MCP: Deobfuscate LLM output
-    MCP->>Project: Apply restored files in root_dir
-    MCP-->>IDE: applied_files
+    IDE->>MCP: status(workspace_dir, options.request_id) / push(workspace_dir, options.request_id)
+    MCP->>MCP: Deobfuscate and apply workspace delta
+    MCP->>Project: Apply add/modify/delete in source root
+    MCP-->>IDE: applied_files / deleted_files
     IDE-->>User: Show result
 ```
 
@@ -59,7 +51,8 @@ sequenceDiagram
 curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | CODE_OBFUSCATOR_INSTALL_REPO=sawrus/code-obfuscator bash
 ```
 
-Binaries are installed from GitHub Releases: [sawrus/code-obfuscator/releases](https://github.com/sawrus/code-obfuscator/releases).
+Binaries are installed from GitHub
+Releases: [sawrus/code-obfuscator/releases](https://github.com/sawrus/code-obfuscator/releases).
 
 ### execute
 
@@ -75,13 +68,47 @@ code-obfuscator
 make mcp-docker-build
 ```
 
-### start
+### codex (stdio)
+
+Register MCP server in Codex:
+
+```bash
+codex mcp remove code_obfuscator >/dev/null 2>&1 || true
+PROJECTS_HOST_DIR="${MCP_PROJECTS_HOST_DIR:-$HOME/projects}"
+CONTAINER_NAME="${CONTAINER_NAME:-code-obfuscator-mcp}"
+codex mcp add code_obfuscator -- \
+  docker run --rm -i --name "$CONTAINER_NAME" \
+  -e MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json \
+  -e MCP_LOG_STDOUT=false \
+  -v "$HOME/mcp/code-obfuscator/mapping.default.json:/data/mapping.default.json:ro" \
+  -v "$PROJECTS_HOST_DIR:/workspace/projects:rw" \
+  code-obfuscator-mcp:local
+```
+
+This command only saves the MCP configuration. It does not start the container immediately.
+Codex launches the stdio server on first MCP use.
+
+### codex (http)
+
+1. Start the HTTP MCP server:
 
 ```bash
 MCP_HTTP_ADDR=127.0.0.1:18787 \
-MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
+MCP_PROJECTS_HOST_DIR=$HOME/projects \
+MCP_DEFAULT_MAPPING_PATH=$HOME/mcp/code-obfuscator/mapping.default.json \
 ./scripts/run-mcp-docker.sh
 ```
+
+2. Register the HTTP endpoint in Codex:
+
+```bash
+codex mcp remove code_obfuscator >/dev/null 2>&1 || true
+codex mcp add code_obfuscator --url http://127.0.0.1:18787/mcp
+```
+
+For `http`, Codex connects to the already running endpoint. Unlike `stdio`, Codex does not start the server for you.
+
+`MCP_PROJECTS_HOST_DIR` maps to `-v "<ABS_PATH>:/workspace/projects:rw"` inside Docker.
 
 ### health check
 
@@ -91,10 +118,11 @@ curl -i http://127.0.0.1:18787/health
 
 ## Detailed Documentation
 
-- Full documentation (install lifecycle, CLI/TUI modes, MCP integrations, architecture, troubleshooting): [docs/DETAILS.md](docs/DETAILS.md)
+- Full documentation (install lifecycle, CLI/TUI modes, MCP integrations, architecture,
+  troubleshooting): [docs/DETAILS.md](docs/DETAILS.md)
 - Security and performance: [docs/SECURITY_AND_PERFORMANCE.md](docs/SECURITY_AND_PERFORMANCE.md)
 - Samples: [docs/SAMPLES.md](docs/SAMPLES.md)
-- MCP server plan: [docs/MCP_SERVER_PLAN.md](docs/MCP_SERVER_PLAN.md)
+- MCP server plan: [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md)
 
 ## Development
 

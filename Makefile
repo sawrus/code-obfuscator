@@ -40,7 +40,7 @@ e2e: ## Run CLI end-to-end tests
 	cargo test --test e2e
 
 e2e-blackbox: ## Run the black-box shell scenario
-	bash test/e2e_blackbox.sh
+	bash scripts/e2e_blackbox.sh
 
 svt: ## Run ignored stress-validation tests
 	cargo test --test svt -- --ignored

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::backtrace::Backtrace;
 #[path = "../error.rs"]
 mod error;
 #[path = "../fs_ops.rs"]
@@ -15,6 +16,7 @@ mod obfuscator;
 
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::env;
+use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -25,7 +27,7 @@ use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use error::{AppError, AppResult};
-use fs_ops::FileEntry;
+use fs_ops::{FileEntry, RootGitignore};
 use mapping::{MappingFile, detect_terms, enrich_with_random, invert};
 use mcp_logging::{LogEvent, McpLogger};
 use serde::{Deserialize, Serialize};
@@ -466,16 +468,34 @@ struct MappingState {
     workspace_dir: String,
 }
 
+fn format_fatal_error(context: &str, err: &dyn Display) -> String {
+    format!(
+        "{context}: {err}\nbacktrace:\n{}",
+        Backtrace::force_capture()
+    )
+}
+
+fn log_error_with_backtrace(logger: &McpLogger, event: LogEvent<'_>, err: &dyn Display) {
+    let message = err.to_string();
+    logger.log_backtrace(event, &message);
+}
+
 fn main() {
     if let Err(err) = run() {
-        eprintln!("error: {err}");
+        eprintln!("{}", format_fatal_error("fatal mcp server error", &err));
         std::process::exit(1);
     }
 }
 
 fn run() -> AppResult<()> {
     let logger = McpLogger::from_env()?;
+    logger.install_panic_hook();
     let mapping_path = env::var("MCP_DEFAULT_MAPPING_PATH").ok().map(PathBuf::from);
+    let http_addr = env::var("MCP_HTTP_ADDR")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+    let disable_stdio = parse_env_bool("MCP_DISABLE_STDIO").unwrap_or(false);
     let state = AppState {
         default_mapping: MappingStore::new(mapping_path),
         request_mappings: RequestMappingStore::new(
@@ -485,20 +505,28 @@ fn run() -> AppResult<()> {
         logger,
     };
 
-    state.logger.log(LogEvent {
-        level: "info",
-        transport: "stdio",
-        direction: "lifecycle",
-        request_id: None,
-        jsonrpc_id: None,
-        method: None,
-        path: None,
-        status: Some("ready"),
-        duration_ms: None,
-        payload: None,
-    });
+    if disable_stdio && http_addr.is_none() {
+        return Err(AppError::InvalidArg(
+            "MCP_DISABLE_STDIO requires MCP_HTTP_ADDR".into(),
+        ));
+    }
 
-    if let Ok(addr) = env::var("MCP_HTTP_ADDR") {
+    if !disable_stdio {
+        state.logger.log(LogEvent {
+            level: "info",
+            transport: "stdio",
+            direction: "lifecycle",
+            request_id: None,
+            jsonrpc_id: None,
+            method: None,
+            path: None,
+            status: Some("ready"),
+            duration_ms: None,
+            payload: None,
+        });
+    }
+
+    if let Some(addr) = http_addr {
         state.logger.log(LogEvent {
             level: "info",
             transport: "http",
@@ -511,15 +539,78 @@ fn run() -> AppResult<()> {
             duration_ms: None,
             payload: Some(&json!({ "addr": addr })),
         });
+
+        if disable_stdio {
+            let http_state = state.clone();
+            let http_logger = state.logger.clone();
+            return run_http_api(&addr, http_state).inspect_err(|err| {
+                log_error_with_backtrace(
+                    &http_logger,
+                    LogEvent {
+                        level: "error",
+                        transport: "http",
+                        direction: "lifecycle",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: None,
+                        path: Some("/"),
+                        status: Some("fatal"),
+                        duration_ms: None,
+                        payload: None,
+                    },
+                    &err,
+                );
+            });
+        }
+
         let state_for_http = state.clone();
+        let http_logger = state.logger.clone();
         thread::spawn(move || {
             if let Err(err) = run_http_api(&addr, state_for_http) {
-                eprintln!("http api error: {err}");
+                log_error_with_backtrace(
+                    &http_logger,
+                    LogEvent {
+                        level: "error",
+                        transport: "http",
+                        direction: "lifecycle",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: None,
+                        path: Some("/"),
+                        status: Some("fatal"),
+                        duration_ms: None,
+                        payload: None,
+                    },
+                    &err,
+                );
+                eprintln!("{}", format_fatal_error("http api error", &err));
             }
         });
     }
 
-    run_stdio_mcp(state)
+    let stdio_state = state.clone();
+    match run_stdio_mcp(state) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            log_error_with_backtrace(
+                &stdio_state.logger,
+                LogEvent {
+                    level: "error",
+                    transport: "stdio",
+                    direction: "lifecycle",
+                    request_id: None,
+                    jsonrpc_id: None,
+                    method: None,
+                    path: None,
+                    status: Some("fatal"),
+                    duration_ms: None,
+                    payload: None,
+                },
+                &err,
+            );
+            Err(err)
+        }
+    }
 }
 
 fn run_stdio_mcp(state: AppState) -> AppResult<()> {
@@ -555,7 +646,25 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
         if id_opt.is_none() {
             let status = match handle_request(req, &state) {
                 Ok(_) => "notification_ok",
-                Err(_) => "notification_error",
+                Err(err) => {
+                    log_error_with_backtrace(
+                        &state.logger,
+                        LogEvent {
+                            level: "error",
+                            transport: "stdio",
+                            direction: "response",
+                            request_id: request_id.as_deref(),
+                            jsonrpc_id: None,
+                            method: Some(&method),
+                            path: None,
+                            status: Some("notification_error"),
+                            duration_ms: Some(started.elapsed().as_millis()),
+                            payload: None,
+                        },
+                        &err,
+                    );
+                    "notification_error"
+                }
             };
             state.logger.log(LogEvent {
                 level: "info",
@@ -580,12 +689,30 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
                 result: Some(result),
                 error: None,
             },
-            Err(err) => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(json!({"code": -32000, "message": err.to_string()})),
-            },
+            Err(err) => {
+                log_error_with_backtrace(
+                    &state.logger,
+                    LogEvent {
+                        level: "error",
+                        transport: "stdio",
+                        direction: "response",
+                        request_id: request_id.as_deref(),
+                        jsonrpc_id: Some(&id),
+                        method: Some(&method),
+                        path: None,
+                        status: Some("error"),
+                        duration_ms: Some(started.elapsed().as_millis()),
+                        payload: None,
+                    },
+                    &err,
+                );
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(json!({"code": -32000, "message": err.to_string()})),
+                }
+            }
         };
 
         let response_payload = serde_json::to_value(&response).ok();
@@ -614,28 +741,65 @@ fn run_stdio_mcp(state: AppState) -> AppResult<()> {
         )?;
     }
 
+    state.logger.log(LogEvent {
+        level: "info",
+        transport: "stdio",
+        direction: "lifecycle",
+        request_id: None,
+        jsonrpc_id: None,
+        method: None,
+        path: None,
+        status: Some("shutdown"),
+        duration_ms: None,
+        payload: None,
+    });
+
     Ok(())
 }
 
 fn run_http_api(addr: &str, state: AppState) -> AppResult<()> {
     let listener = TcpListener::bind(addr)?;
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else {
-            state.logger.log(LogEvent {
-                level: "warn",
-                transport: "http",
-                direction: "request",
-                request_id: None,
-                jsonrpc_id: None,
-                method: None,
-                path: None,
-                status: Some("accept_failed"),
-                duration_ms: None,
-                payload: None,
-            });
-            continue;
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                log_error_with_backtrace(
+                    &state.logger,
+                    LogEvent {
+                        level: "error",
+                        transport: "http",
+                        direction: "lifecycle",
+                        request_id: None,
+                        jsonrpc_id: None,
+                        method: None,
+                        path: None,
+                        status: Some("accept_failed"),
+                        duration_ms: None,
+                        payload: None,
+                    },
+                    &err,
+                );
+                continue;
+            }
         };
-        let _ = handle_http_connection(&mut stream, &state);
+        if let Err(err) = handle_http_connection(&mut stream, &state) {
+            log_error_with_backtrace(
+                &state.logger,
+                LogEvent {
+                    level: "error",
+                    transport: "http",
+                    direction: "response",
+                    request_id: None,
+                    jsonrpc_id: None,
+                    method: None,
+                    path: None,
+                    status: Some("connection_error"),
+                    duration_ms: None,
+                    payload: None,
+                },
+                &err,
+            );
+        }
     }
     Ok(())
 }
@@ -649,6 +813,23 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     }
     let parts: Vec<&str> = first.split_whitespace().collect();
     if parts.len() < 2 {
+        let err = AppError::InvalidArg("bad request".into());
+        log_error_with_backtrace(
+            &state.logger,
+            LogEvent {
+                level: "error",
+                transport: "http-admin",
+                direction: "response",
+                request_id: None,
+                jsonrpc_id: None,
+                method: None,
+                path: None,
+                status: Some("bad_request"),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: None,
+            },
+            &err,
+        );
         write_http_json(stream, 400, &json!({"error":"bad request"}))?;
         state.logger.log(LogEvent {
             level: "warn",
@@ -666,6 +847,11 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     }
     let method = parts[0];
     let path = parts[1];
+    let transport = if path == "/" || path == "/mcp" {
+        "http-mcp"
+    } else {
+        "http-admin"
+    };
 
     let mut content_length = 0_usize;
     loop {
@@ -688,13 +874,30 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     }
 
     if content_length > MAX_HTTP_BODY_BYTES {
+        let err = AppError::InvalidArg(format!(
+            "request body exceeds max size: {content_length} > {MAX_HTTP_BODY_BYTES}"
+        ));
+        log_error_with_backtrace(
+            &state.logger,
+            LogEvent {
+                level: "error",
+                transport,
+                direction: "response",
+                request_id: None,
+                jsonrpc_id: None,
+                method: Some(method),
+                path: Some(path),
+                status: Some("bad_request"),
+                duration_ms: Some(started.elapsed().as_millis()),
+                payload: None,
+            },
+            &err,
+        );
         write_http_json(
             stream,
             400,
             &json!({
-                "error": format!(
-                    "request body exceeds max size: {content_length} > {MAX_HTTP_BODY_BYTES}"
-                )
+                "error": err.to_string()
             }),
         )?;
         return Ok(());
@@ -706,11 +909,6 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
     }
     let body_text = String::from_utf8(body).unwrap_or_default();
     let body_json = serde_json::from_str::<Value>(&body_text).ok();
-    let transport = if path == "/" || path == "/mcp" {
-        "http-mcp"
-    } else {
-        "http-admin"
-    };
     let fallback_payload = if body_text.is_empty() {
         None
     } else {
@@ -796,6 +994,22 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
                     Ok(())
                 }
                 Err(err) => {
+                    log_error_with_backtrace(
+                        &state.logger,
+                        LogEvent {
+                            level: "error",
+                            transport,
+                            direction: "response",
+                            request_id: None,
+                            jsonrpc_id: None,
+                            method: Some(method),
+                            path: Some(path),
+                            status: Some("error"),
+                            duration_ms: Some(started.elapsed().as_millis()),
+                            payload: None,
+                        },
+                        &err,
+                    );
                     let response = json!({"error":err.to_string()});
                     write_http_json(stream, 400, &response)?;
                     state.logger.log(LogEvent {
@@ -821,6 +1035,22 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
             let req = match req {
                 Ok(req) => req,
                 Err(err) => {
+                    log_error_with_backtrace(
+                        &state.logger,
+                        LogEvent {
+                            level: "error",
+                            transport,
+                            direction: "response",
+                            request_id: None,
+                            jsonrpc_id: None,
+                            method: Some(method),
+                            path: Some(path),
+                            status: Some("bad_request"),
+                            duration_ms: Some(started.elapsed().as_millis()),
+                            payload: None,
+                        },
+                        &err,
+                    );
                     let response = json!({"error": err.to_string()});
                     write_http_json(stream, 400, &response)?;
                     state.logger.log(LogEvent {
@@ -846,7 +1076,25 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
             if jsonrpc_id.is_none() {
                 let status = match handle_request(req, state) {
                     Ok(_) => "notification_ok",
-                    Err(_) => "notification_error",
+                    Err(err) => {
+                        log_error_with_backtrace(
+                            &state.logger,
+                            LogEvent {
+                                level: "error",
+                                transport,
+                                direction: "response",
+                                request_id: request_id.as_deref(),
+                                jsonrpc_id: None,
+                                method: Some(&request_method),
+                                path: Some(path),
+                                status: Some("notification_error"),
+                                duration_ms: Some(started.elapsed().as_millis()),
+                                payload: None,
+                            },
+                            &err,
+                        );
+                        "notification_error"
+                    }
                 };
                 write_http_no_content(stream, 204)?;
                 state.logger.log(LogEvent {
@@ -872,12 +1120,30 @@ fn handle_http_connection(stream: &mut TcpStream, state: &AppState) -> AppResult
                     result: Some(result),
                     error: None,
                 },
-                Err(err) => JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: None,
-                    error: Some(json!({"code": -32000, "message": err.to_string()})),
-                },
+                Err(err) => {
+                    log_error_with_backtrace(
+                        &state.logger,
+                        LogEvent {
+                            level: "error",
+                            transport,
+                            direction: "response",
+                            request_id: request_id.as_deref(),
+                            jsonrpc_id: Some(&id),
+                            method: Some(&request_method),
+                            path: Some(path),
+                            status: Some("error"),
+                            duration_ms: Some(started.elapsed().as_millis()),
+                            payload: None,
+                        },
+                        &err,
+                    );
+                    JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(json!({"code": -32000, "message": err.to_string()})),
+                    }
+                }
             };
 
             let response_payload = serde_json::to_value(&response)?;
@@ -1089,6 +1355,7 @@ fn call_tool(params: ToolCallParams, state: &AppState) -> AppResult<Value> {
 
 fn ls_tree(args: LsTreeArgs) -> AppResult<ProjectTreeResult> {
     let root = resolve_root_dir(&args.root_dir)?;
+    let gitignore = RootGitignore::from_root(&root)?;
     let max_depth = args
         .max_depth
         .unwrap_or(DEFAULT_TREE_MAX_DEPTH)
@@ -1105,6 +1372,15 @@ fn ls_tree(args: LsTreeArgs) -> AppResult<ProjectTreeResult> {
     for entry in WalkDir::new(&root)
         .max_depth(max_depth)
         .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            !gitignore.is_ignored_rel(rel, entry.file_type().is_dir())
+        })
         .flatten()
     {
         let path = entry.path();
@@ -1146,6 +1422,7 @@ fn ls_tree(args: LsTreeArgs) -> AppResult<ProjectTreeResult> {
 
 fn ls_files(args: LsFilesArgs) -> AppResult<LsFilesResult> {
     let root = resolve_root_dir(&args.root_dir)?;
+    let gitignore = RootGitignore::from_root(&root)?;
     let max_entries = args
         .max_entries
         .unwrap_or(DEFAULT_TREE_MAX_ENTRIES)
@@ -1155,7 +1432,19 @@ fn ls_files(args: LsFilesArgs) -> AppResult<LsFilesResult> {
     let mut files = Vec::new();
     let mut truncated = false;
 
-    for entry in WalkDir::new(&root).into_iter().flatten() {
+    for entry in WalkDir::new(&root)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == root {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return false;
+            };
+            !gitignore.is_ignored_rel(rel, entry.file_type().is_dir())
+        })
+        .flatten()
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1533,6 +1822,7 @@ fn load_project_files_from_disk(
     file_paths: &[String],
 ) -> AppResult<Vec<ProjectFile>> {
     let root = resolve_root_dir(root_dir)?;
+    let gitignore = RootGitignore::from_root(&root)?;
     if file_paths.is_empty() {
         let entries = fs_ops::read_text_tree(&root)?;
         return Ok(entries
@@ -1547,6 +1837,9 @@ fn load_project_files_from_disk(
     let mut files = Vec::with_capacity(file_paths.len());
     for rel in file_paths {
         let full = resolve_path_under_root(&root, rel)?;
+        if gitignore.is_ignored_abs(&full, false) {
+            continue;
+        }
         let text = fs::read_to_string(&full)
             .map_err(|_| AppError::InvalidArg(format!("failed to read UTF-8 file: {rel}")))?;
         let rel_path = full

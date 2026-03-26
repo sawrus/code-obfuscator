@@ -1,0 +1,26 @@
+QUERY_1 = """
+select a.account_id, a.user_id
+from accounts a
+where a.user_id = %(user_id)s
+order by a.account_id
+"""
+
+QUERY_2 = """
+select t.tx_id, t.amount, t.currency
+from transactions t
+where t.account_id = %(account_id)s
+  and t.status = 'posted'
+order by t.created_at desc
+"""
+
+QUERY_3 = """
+with daily_totals as (
+    select date_trunc('day', t.created_at) as day, sum(t.amount) as total_amount
+    from transactions t
+    where t.account_id = %(account_id)s
+    group by 1
+)
+select day, total_amount
+from daily_totals
+order by day desc
+"""

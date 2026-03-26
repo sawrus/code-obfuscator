@@ -132,6 +132,12 @@ fn kill_and_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn read_pipe(mut pipe: impl Read) -> String {
+    let mut text = String::new();
+    pipe.read_to_string(&mut text).expect("read pipe");
+    text
+}
+
 fn find_tool<'a>(tools: &'a [Value], name: &str) -> &'a Value {
     tools
         .iter()
@@ -223,6 +229,83 @@ fn mcp_resources_endpoints_return_empty_lists() {
 
     drop(stdin);
     let _ = child.wait();
+}
+
+#[test]
+fn mcp_stdio_logs_to_stderr_without_corrupting_stdout() {
+    let dir = tempdir().expect("tmp");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_DIR", dir.path().join("logs"))
+        .env("MCP_LOG_MODE", "default")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":"stdio-log-1",
+            "method":"initialize",
+            "params":{"protocolVersion":"2025-11-25"}
+        }),
+    );
+    let response = read_response(&mut stdout);
+    assert!(response.get("error").is_none(), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+
+    let stderr_text = read_pipe(stderr);
+    assert!(stderr_text.contains("REQUEST"), "{stderr_text}");
+    assert!(stderr_text.contains("transport: stdio"), "{stderr_text}");
+    assert!(stderr_text.contains("method: initialize"), "{stderr_text}");
+}
+
+#[test]
+fn mcp_stdio_error_logs_include_backtrace() {
+    let dir = tempdir().expect("tmp");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_DIR", dir.path().join("logs"))
+        .env("MCP_LOG_MODE", "default")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+
+    send_request(
+        &mut stdin,
+        &json!({
+            "jsonrpc":"2.0",
+            "id":"stdio-log-2",
+            "method":"tools/call",
+            "params":{"name":"legacy_pull","arguments":{}}
+        }),
+    );
+    let response = read_response(&mut stdout);
+    assert!(response["error"].is_object(), "{response}");
+
+    drop(stdin);
+    let _ = child.wait();
+
+    let stderr_text = read_pipe(stderr);
+    assert!(stderr_text.contains("ERROR"), "{stderr_text}");
+    assert!(stderr_text.contains("backtrace:"), "{stderr_text}");
+    assert!(
+        stderr_text.contains("unknown or disabled tool"),
+        "{stderr_text}"
+    );
 }
 
 #[test]
@@ -444,6 +527,153 @@ fn mcp_pull_obfuscates_root_dir_subset() {
             .contains("mmm.users"),
         "{payload}"
     );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_gitignore_filters_ls_files_and_pull_clone() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::create_dir_all(project.join("ignored_dir")).expect("mkdirs");
+    fs::write(project.join(".gitignore"), "ignored_dir/\n*.secret\n").expect("write");
+    fs::write(project.join("app/query.py"), "select * from bs.users\n").expect("write");
+    fs::write(
+        project.join("ignored_dir/drop.py"),
+        "select * from bs.audit\n",
+    )
+    .expect("write");
+    fs::write(project.join("app/token.secret"), "xxx\n").expect("write");
+
+    let mapping_path = dir.path().join("mapping.default.json");
+    fs::write(&mapping_path, r#"{"bs":"mmm"}"#).expect("write mapping");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_DEFAULT_MAPPING_PATH", &mapping_path)
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    let files_response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        30,
+        "ls_files",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "max_entries": 20
+        }),
+    );
+    let files_payload = parse_tool_payload(&files_response);
+    let files = files_payload["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|f| f.as_str() == Some("app/query.py")),
+        "{files_payload}"
+    );
+    assert!(
+        files
+            .iter()
+            .all(|f| f.as_str() != Some("ignored_dir/drop.py")
+                && f.as_str() != Some("app/token.secret")),
+        "{files_payload}"
+    );
+
+    let pull_response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        31,
+        "pull",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "options": {"request_id":"gitignore-pull-1"}
+        }),
+    );
+    let pull_payload = parse_tool_payload(&pull_response);
+    let pull_files = pull_payload["obfuscated_files"]
+        .as_array()
+        .expect("pull files");
+    assert!(
+        pull_files
+            .iter()
+            .any(|f| f["path"].as_str() == Some("app/query.py")),
+        "{pull_payload}"
+    );
+    assert!(
+        pull_files
+            .iter()
+            .all(|f| f["path"].as_str() != Some("ignored_dir/drop.py")
+                && f["path"].as_str() != Some("app/token.secret")),
+        "{pull_payload}"
+    );
+
+    let clone_response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        32,
+        "clone",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "workspace_dir": workspace.to_string_lossy().to_string(),
+            "options": {"request_id":"gitignore-clone-1"}
+        }),
+    );
+    let clone_payload = parse_tool_payload(&clone_response);
+    let cloned_files = clone_payload["cloned_files"].as_array().expect("cloned");
+    assert!(
+        cloned_files.iter().all(|f| {
+            f.as_str() != Some("ignored_dir/drop.py") && f.as_str() != Some("app/token.secret")
+        }),
+        "{clone_payload}"
+    );
+    assert!(!workspace.join("ignored_dir/drop.py").exists());
+    assert!(!workspace.join("app/token.secret").exists());
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
+fn mcp_pull_skips_explicit_file_path_ignored_by_gitignore() {
+    let dir = tempdir().expect("tmp");
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join("app")).expect("mkdirs");
+    fs::write(project.join(".gitignore"), "*.secret\n").expect("write");
+    fs::write(project.join("app/token.secret"), "value\n").expect("write");
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+        .env("MCP_LOG_STDOUT", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    let response = call_tool(
+        &mut stdin,
+        &mut stdout,
+        33,
+        "pull",
+        json!({
+            "root_dir": project.to_string_lossy().to_string(),
+            "file_paths": ["app/token.secret"],
+            "options": {"request_id":"gitignore-explicit-1"}
+        }),
+    );
+    let payload = parse_tool_payload(&response);
+    let files = payload["obfuscated_files"]
+        .as_array()
+        .expect("obfuscated_files");
+    assert!(files.is_empty(), "{payload}");
 
     drop(stdin);
     let _ = child.wait();
@@ -721,4 +951,55 @@ fn mcp_http_jsonrpc_supports_new_pull_tool() {
     assert!(content.contains("mmm.users"), "{payload}");
 
     kill_and_wait(&mut child);
+}
+
+#[test]
+fn mcp_http_only_mode_disables_stdio_lifecycle_and_serves_requests() {
+    let _guard = http_test_lock();
+    let (addr, mut child) = (0..8)
+        .find_map(|_| {
+            let port = free_port();
+            let addr = format!("127.0.0.1:{port}");
+            let mut child = Command::new(assert_cmd::cargo::cargo_bin!("mcp-server"))
+                .env("MCP_HTTP_ADDR", &addr)
+                .env("MCP_DISABLE_STDIO", "true")
+                .env("MCP_LOG_MODE", "system")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn server");
+            if wait_http_ready(&mut child, &addr) {
+                Some((addr, child))
+            } else {
+                kill_and_wait(&mut child);
+                None
+            }
+        })
+        .expect("start http-only server on a free port");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let body = json!({
+        "jsonrpc":"2.0",
+        "id":"http-only-init",
+        "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25"}
+    });
+
+    let resp = http_request(&addr, "POST", "/mcp", Some(&body.to_string()));
+    let (status, json_body) = http_status_and_json(&resp);
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        json_body["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25")
+    );
+
+    kill_and_wait(&mut child);
+
+    let stdout_text = read_pipe(stdout);
+    let stderr_text = read_pipe(stderr);
+    assert!(stdout_text.contains("transport: http"), "{stdout_text}");
+    assert!(!stdout_text.contains("transport: stdio"), "{stdout_text}");
+    assert!(!stderr_text.contains("transport: stdio"), "{stderr_text}");
 }

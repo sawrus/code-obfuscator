@@ -3,9 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-EXTRACT_PROMPT_TEMPLATE="$SCRIPT_DIR/prompt_extract_sql.txt"
-EXTRACT_SOURCE_FILE="$SCRIPT_DIR/query_api_x.py"
-EXTRACT_EXPECTED_FILE="$SCRIPT_DIR/query_api_x_expected.txt"
+FIXTURE_DIR="$REPO_ROOT/test-projects/blackbox"
+EXTRACT_PROMPT_TEMPLATE="$FIXTURE_DIR/prompt_extract_sql.txt"
+EXTRACT_SOURCE_FILE="$FIXTURE_DIR/query_api_x.py"
+EXTRACT_EXPECTED_FILE="$FIXTURE_DIR/query_api_x_expected.txt"
 MAPPING_DIR="$HOME/mcp/code-obfuscator"
 MAPPING_FILE="$MAPPING_DIR/mapping.default.json"
 
@@ -102,6 +103,26 @@ assert_text_file_equals() {
   fi
 }
 
+assert_text_contains() {
+  local file="$1"
+  local pattern="$2"
+  if ! grep -q "$pattern" "$file"; then
+    echo "expected pattern not found: $pattern" >&2
+    cat "$file" >&2
+    return 1
+  fi
+}
+
+assert_text_absent() {
+  local file="$1"
+  local pattern="$2"
+  if grep -q "$pattern" "$file"; then
+    echo "unexpected pattern found: $pattern" >&2
+    cat "$file" >&2
+    return 1
+  fi
+}
+
 wait_for_http_ready() {
   local port="$1"
   local attempts=30
@@ -124,32 +145,35 @@ start_http_server() {
   local http_port="$4"
 
   docker rm -f "$container_name" >/dev/null 2>&1 || true
-  if ! docker run -d -i --rm \
-    --name "$container_name" \
-    -e "MCP_HTTP_ADDR=0.0.0.0:${http_port}" \
-    -e MCP_DEFAULT_MAPPING_PATH=/data/mapping.default.json \
-    -e MCP_LOG_STDOUT=false \
-    -v "$MAPPING_FILE:/data/mapping.default.json:ro" \
-    -v "$projects_host_dir:/workspace/projects:rw" \
-    -p "${http_port}:${http_port}" \
-    code-obfuscator-mcp:local >/dev/null; then
-    docker logs "$container_name" >"$log_file" 2>&1 || true
+  MCP_HTTP_ADDR="127.0.0.1:${http_port}" \
+  MCP_DEFAULT_MAPPING_PATH="$MAPPING_FILE" \
+  MCP_PROJECTS_HOST_DIR="$projects_host_dir" \
+  MCP_LOG_STDOUT=true \
+  MCP_LOG_MODE=system \
+  MCP_SKIP_DOCKER_BUILD=true \
+  MCP_CONTAINER_NAME="$container_name" \
+    bash "$REPO_ROOT/scripts/run-mcp-docker.sh" >"$log_file" 2>&1 &
+  SCENARIO_SERVER_PID="$!"
+
+  if ! wait_for_http_ready "$http_port"; then
     cat "$log_file" >&2
     return 1
   fi
 
-  if ! wait_for_http_ready "$http_port"; then
-    docker logs "$container_name" >"$log_file" 2>&1 || true
-    cat "$log_file" >&2
-    return 1
-  fi
+  assert_text_contains "$log_file" "transport: http"
+  assert_text_absent "$log_file" "transport: stdio"
 }
 
 cleanup_scenario() {
   local status="$1"
   local tmpdir="$2"
   local container_name="$3"
+  local server_pid="$4"
 
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$container_name" ]]; then
     docker rm -f "$container_name" >/dev/null 2>&1 || true
   fi
@@ -167,6 +191,7 @@ scenario_extract_sql() {
   local transport="$2"
   local container_name="code-obfuscator-mcp-${transport}-$$"
   SCENARIO_CONTAINER_NAME="$container_name"
+  SCENARIO_SERVER_PID=""
 
   local output_file="$tmpdir/codex-output.txt"
   local last_message_file="$tmpdir/codex-last-message.txt"
@@ -217,6 +242,10 @@ scenario_extract_sql() {
   fi
 
   assert_text_file_equals "$EXTRACT_EXPECTED_FILE" "$last_message_file" "SQL extraction output"
+  if [[ "$transport" == "http" ]]; then
+    assert_text_contains "$http_log_file" "status: listening"
+    assert_text_absent "$http_log_file" "transport: stdio"
+  fi
 
   echo "blackbox ok: SQL extraction over ${transport} matched expected result"
 }
@@ -231,6 +260,7 @@ run_scenario() {
   tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/code-obfuscator-${name}.XXXXXX")"
   echo "running blackbox scenario: ${name}"
   SCENARIO_CONTAINER_NAME=""
+  SCENARIO_SERVER_PID=""
   set +e
   (
     set -euo pipefail
@@ -238,7 +268,7 @@ run_scenario() {
   )
   local_status=$?
   set -e
-  cleanup_scenario "$local_status" "$tmpdir" "$SCENARIO_CONTAINER_NAME"
+  cleanup_scenario "$local_status" "$tmpdir" "$SCENARIO_CONTAINER_NAME" "$SCENARIO_SERVER_PID"
   return "$local_status"
 }
 

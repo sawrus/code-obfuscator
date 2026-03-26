@@ -38,7 +38,7 @@
 - CMD-UNIT: `cargo test --bins` -> PASS
 - CMD-INT: `cargo test --test mcp_server -- --nocapture` -> PASS
 - CMD-SEC: `cargo test --test security_tests -- --nocapture` -> PASS
-- CMD-BB: `bash test/e2e_blackbox.sh` -> PASS
+- CMD-BB: `bash scripts/e2e_blackbox.sh` -> PASS
 - CMD-GATE: `make lint && make test && make e2e-blackbox` -> PASS
 
 ## Severity Rubric

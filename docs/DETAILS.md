@@ -178,6 +178,19 @@ delta through `push`.
 - `MCP_LOG_MAX_BYTES`
 - `MCP_LOG_MAX_FILES`
 - `MCP_LOG_STDOUT`
+- `MCP_LOG_MODE`
+
+`MCP_LOG_MODE` values:
+
+- `deep` - log all request/response bodies with full payloads
+- `default` - log request/response bodies in readable `key: value` form with file contents redacted
+- `system` - log only lifecycle, health, warning, and error events
+
+Console sinks are transport-aware:
+
+- `stdio` logs go to `stderr` so MCP protocol output remains clean on `stdout`
+- `http` logs go to `stdout` so they are visible in Docker container logs
+- file logs always use the same readable multi-line format in `MCP_LOG_DIR`
 
 ## CLI and TUI modes
 
@@ -320,6 +333,9 @@ MCP_DEFAULT_MAPPING_PATH=./mapping.default.json \
 ./scripts/run-mcp-docker.sh
 ```
 
+With `MCP_HTTP_ADDR` set, `./scripts/run-mcp-docker.sh` launches the container in HTTP-only mode.
+Use it to keep the MCP server running in a terminal, then connect your IDE by URL. Do not register this script itself as a stdio MCP command.
+
 4. Verify:
 
 ```bash
@@ -329,7 +345,7 @@ curl -i http://127.0.0.1:18787/mapping
 
 ## MCP integration in agent IDEs
 
-All IDE examples below use one canonical Docker runtime pattern (synchronized with `test/mcp_configure.sh`).
+All IDE examples below use one canonical Docker runtime pattern (synchronized with `scripts/mcp_configure.sh`).
 Only the config file format differs by IDE.
 
 ### Canonical Docker template
@@ -471,7 +487,7 @@ Transport: `stdio`
 ```toml
 [mcp_servers.code_obfuscator]
 enabled = true
-url = "http://127.0.0.1:18787"
+url = "http://127.0.0.1:18787/mcp"
 ```
 
 ### Option 2: stdio + Docker
@@ -512,11 +528,11 @@ Scenario steps:
 
 1. Builds a fresh MCP Docker image via `make mcp-docker-build`.
 2. Stages a fixture project under `/workspace/projects/.../api-x-api/query.py` with three SQL blocks.
-3. Reconfigures Codex MCP via `test/mcp_configure.sh` for two transports: `stdio` and `http`.
-4. Runs `codex exec` twice with prompt from `test/prompt_extract_sql.txt`.
-5. Verifies that both runs return the exact extracted SQL blocks from `test/query_api-x_expected.txt`.
+3. Reconfigures Codex MCP via `scripts/mcp_configure.sh` for two transports: `stdio` and `http`.
+4. Runs `codex exec` twice with prompt from `test-projects/blackbox/prompt_extract_sql.txt`.
+5. Verifies that both runs return the exact extracted SQL blocks from `test-projects/blackbox/query_api_x_expected.txt`.
 
 ## Prompt templates
 
-General prompt templates are in `test/prompt_general.md`.
-The blackbox extraction fixture prompt is in `test/prompt_extract_sql.txt`.
+Prompt examples are in `skills/code-obfuscator/references/prompt-templates.md`.
+The blackbox extraction fixture prompt is in `test-projects/blackbox/prompt_extract_sql.txt`.

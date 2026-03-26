@@ -28,6 +28,11 @@ Each `request_id` stores mapping payload and session context:
 - clone target must be empty and different from source root,
 - push applies only within bound source root.
 
+## File selection rules
+- MCP tools respect `<root_dir>/.gitignore` when scanning project files.
+- `ls_tree` and `ls_files` keep `include_hidden` as a separate switch for dot-paths; `.gitignore` filters are still applied.
+- `pull` with explicit `file_paths` skips paths ignored by `<root_dir>/.gitignore`.
+
 ## Acceptance checks
 - `make lint`
 - `make test`

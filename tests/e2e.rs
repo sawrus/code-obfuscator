@@ -6,11 +6,18 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+fn command_with_isolated_config(config_home: &Path) -> Command {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd
+}
+
 #[test]
 fn forward_then_reverse_restores_code() {
     let src = tempdir().expect("src");
     let obf = tempdir().expect("obf");
     let rev = tempdir().expect("rev");
+    let cfg = tempdir().expect("cfg");
     fs::write(
         src.path().join("main.rs"),
         "fn Freeze() { let Antifraud = 1; // Freeze in comment\nprintln!(\"Antifraud\"); }",
@@ -19,7 +26,7 @@ fn forward_then_reverse_restores_code() {
     let map = src.path().join("mapping.json");
     fs::write(&map, "{\"Freeze\":\"Go\",\"Antifraud\":\"Apple\"}").expect("map");
 
-    let mut c1 = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut c1 = command_with_isolated_config(cfg.path());
     c1.arg("--mode")
         .arg("forward")
         .arg("--source")
@@ -34,7 +41,7 @@ fn forward_then_reverse_restores_code() {
     assert!(obf_file.contains("Go"));
     assert!(obf_file.contains("Apple"));
 
-    let mut c2 = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut c2 = command_with_isolated_config(cfg.path());
     c2.arg("--mode")
         .arg("reverse")
         .arg("--source")
@@ -52,7 +59,8 @@ fn forward_then_reverse_restores_code() {
 fn fails_without_mapping_in_reverse_mode() {
     let src = tempdir().expect("src");
     let out = tempdir().expect("out");
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let cfg = tempdir().expect("cfg");
+    let mut cmd = command_with_isolated_config(cfg.path());
     cmd.arg("--mode")
         .arg("reverse")
         .arg("--source")
@@ -71,14 +79,13 @@ fn fails_without_mapping_in_forward_mode_by_default() {
     let cfg = tempdir().expect("cfg");
     fs::write(src.path().join("main.py"), "print('ok')\n").expect("write");
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut cmd = command_with_isolated_config(cfg.path());
     cmd.arg("--mode")
         .arg("forward")
         .arg("--source")
         .arg(src.path())
         .arg("--target")
-        .arg(out.path())
-        .env("XDG_CONFIG_HOME", cfg.path());
+        .arg(out.path());
     cmd.assert().failure().stderr(predicate::str::contains(
         "mapping is required in forward mode unless --deep is set",
     ));
@@ -88,13 +95,14 @@ fn fails_without_mapping_in_forward_mode_by_default() {
 fn forward_with_deep_without_mapping_succeeds() {
     let src = tempdir().expect("src");
     let obf = tempdir().expect("obf");
+    let cfg = tempdir().expect("cfg");
     fs::write(
         src.path().join("main.py"),
         "def run_task(user_id):\n    return user_id + 1\n",
     )
     .expect("write");
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut cmd = command_with_isolated_config(cfg.path());
     cmd.arg("--mode")
         .arg("forward")
         .arg("--source")
@@ -129,7 +137,7 @@ fn forward_uses_config_default_mapping_when_flag_is_omitted() {
     )
     .expect("write mapping");
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut cmd = command_with_isolated_config(&config_dir);
     cmd.arg("--mode")
         .arg("forward")
         .arg("--source")
@@ -172,7 +180,7 @@ fn explicit_mapping_overrides_and_updates_config_default() {
     fs::write(&explicit, r#"{"freeze":"from_flag","user_id":"flag_user"}"#)
         .expect("write explicit mapping");
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut cmd = command_with_isolated_config(&config_dir);
     cmd.arg("--mode")
         .arg("forward")
         .arg("--source")
@@ -180,8 +188,7 @@ fn explicit_mapping_overrides_and_updates_config_default() {
         .arg("--target")
         .arg(out.path())
         .arg("--mapping")
-        .arg(&explicit)
-        .env("XDG_CONFIG_HOME", &config_dir);
+        .arg(&explicit);
     cmd.assert().success();
 
     let out_file = fs::read_to_string(out.path().join("main.py")).expect("read output");
@@ -230,10 +237,8 @@ n
         out.path().display()
     );
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
-    cmd.arg("--tui")
-        .write_stdin(input)
-        .env("XDG_CONFIG_HOME", &config_dir);
+    let mut cmd = command_with_isolated_config(&config_dir);
+    cmd.arg("--tui").write_stdin(input);
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("mapping_input_path="));
@@ -259,6 +264,7 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
     ];
 
     let src = tempdir().expect("src");
+    let cfg = tempdir().expect("cfg");
     for case in &languages {
         let fixture = PathBuf::from("test-projects")
             .join(case.folder)
@@ -287,7 +293,7 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
     )
     .expect("write mapping");
 
-    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut forward = command_with_isolated_config(cfg.path());
     forward
         .arg("--mode")
         .arg("forward")
@@ -304,7 +310,7 @@ fn e2e_all_10_languages_roundtrip_and_runtime_when_available() {
         case.runtime.compile_if_available(&file);
     }
 
-    let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut reverse = command_with_isolated_config(cfg.path());
     reverse
         .arg("--mode")
         .arg("reverse")
@@ -331,6 +337,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     let src = tempdir().expect("src");
     let obf = tempdir().expect("obf");
     let rev = tempdir().expect("rev");
+    let cfg = tempdir().expect("cfg");
 
     fs::create_dir_all(src.path().join("pkg")).expect("pkg");
     fs::write(
@@ -344,7 +351,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
     )
     .expect("write main");
 
-    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut forward = command_with_isolated_config(cfg.path());
     forward
         .arg("--mode")
         .arg("forward")
@@ -364,7 +371,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
 
     RuntimeCheck::Python.run_if_available(&obf.path().join("main.py"));
 
-    let mut reverse = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut reverse = command_with_isolated_config(cfg.path());
     reverse
         .arg("--mode")
         .arg("reverse")
@@ -383,6 +390,7 @@ fn regression_python_magic_imports_and_named_args_stay_valid() {
 fn e2e_deep_obfuscation_sql_and_python_with_external_class_guard() {
     let src = tempdir().expect("src");
     let obf = tempdir().expect("obf");
+    let cfg = tempdir().expect("cfg");
 
     fs::create_dir_all(src.path().join("sql")).expect("sql dir");
     fs::create_dir_all(src.path().join("py")).expect("py dir");
@@ -425,7 +433,7 @@ class Falcon8382(User):
     )
     .expect("write map");
 
-    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut forward = command_with_isolated_config(cfg.path());
     forward
         .arg("--mode")
         .arg("forward")
@@ -453,6 +461,7 @@ class Falcon8382(User):
 fn e2e_deep_obfuscation_mapping_for_other_languages() {
     let src = tempdir().expect("src");
     let obf = tempdir().expect("obf");
+    let cfg = tempdir().expect("cfg");
 
     let fixtures = [
         (
@@ -506,7 +515,7 @@ fn e2e_deep_obfuscation_mapping_for_other_languages() {
     let mapping = src.path().join("mapping.json");
     fs::write(&mapping, r#"{"refill_action":"r1","user_id":"u1"}"#).expect("write map");
 
-    let mut forward = Command::new(assert_cmd::cargo::cargo_bin!("code-obfuscator"));
+    let mut forward = command_with_isolated_config(cfg.path());
     forward
         .arg("--mode")
         .arg("forward")

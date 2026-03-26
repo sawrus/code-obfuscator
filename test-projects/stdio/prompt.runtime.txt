@@ -1,0 +1,6 @@
+Работай только через MCP `code_obfuscator`.
+Задача: найди проект, чей runtime path внутри `/workspace/projects` содержит `api-x-api`, затем прочитай `query.py` из этого проекта и выведи SQL-скрипты, которые в нем хранятся.
+Используй один `options.request_id="find-api-x-sql-01"` и такой flow: `tools/list` -> `ls_tree(root_dir="/workspace/projects", ...)` и/или `ls_files(...)`, пока не будет найден путь проекта -> `clone(root_dir="<FOUND_PROJECT_DIR>", workspace_dir="/workspace/projects/team-a/backend/api-x-api-obf", options.request_id=...)` -> прочитай `query.py` из cloned workspace.
+Важно: MCP-вызовы используют runtime paths, а shell-чтение cloned workspace при необходимости делай через host mirror path `test-projects/stdio/projects/team-a/backend/api-x-api-obf`, который соответствует runtime path `/workspace/projects/team-a/backend/api-x-api-obf`.
+Ничего не редактируй. Не вызывай `push`. Если проект или `query.py` не найдены, остановись и верни точную ошибку.
+Финальный ответ должен содержать только извлеченные SQL-блоки в исходном порядке, в формате `-- QUERY_NAME`, затем текст SQL, без markdown fences и без лишних пояснений.

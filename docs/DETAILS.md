@@ -55,13 +55,13 @@ cargo build --release --bin code-obfuscator
 Main one-liner:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | CODE_OBFUSCATOR_INSTALL_REPO=sawrus/code-obfuscator bash
+curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | bash
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | CODE_OBFUSCATOR_INSTALL_REPO=sawrus/code-obfuscator bash -s -- --version 0.5.0
+curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | bash -s -- --version 0.5.0
 ```
 
 Release binaries source:

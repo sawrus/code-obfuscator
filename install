@@ -7,7 +7,7 @@ INSTALL_BIN_DIR="${CODE_OBFUSCATOR_INSTALL_DIR:-${HOME}/.local/bin}"
 RELEASES_DIR="${INSTALL_HOME}/releases"
 MANAGED_BIN_DIR="${INSTALL_HOME}/bin"
 VERSION_FILE="${INSTALL_HOME}/current-version"
-INSTALL_REPO="${CODE_OBFUSCATOR_INSTALL_REPO:-}"
+INSTALL_REPO="${CODE_OBFUSCATOR_INSTALL_REPO:-sawrus/code-obfuscator}"
 INSTALL_BASE_URL="${CODE_OBFUSCATOR_INSTALL_BASE_URL:-}"
 MUTED='\033[0;2m'
 RED='\033[0;31m'
@@ -349,7 +349,15 @@ add_to_path() {
 
 configure_shell_path() {
   [[ "$no_modify_path" == true ]] && return 0
-  case "$(basename "${SHELL:-sh}")" in
+  case "$(basename "${SHELL:-bash}")" in
+    bash)
+      local bashrc_file="$HOME/.bashrc"
+      local bash_profile_file="$HOME/.bash_profile"
+      touch "$bashrc_file"
+      add_to_path "$bashrc_file" "export PATH=${INSTALL_BIN_DIR}:\$PATH"
+      touch "$bash_profile_file"
+      add_to_path "$bash_profile_file" "export PATH=${INSTALL_BIN_DIR}:\$PATH"
+      ;;
     zsh)
       local file="${ZDOTDIR:-$HOME}/.zshrc"
       touch "$file"

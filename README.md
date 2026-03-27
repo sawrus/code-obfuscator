@@ -48,7 +48,7 @@ sequenceDiagram
 ### install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | CODE_OBFUSCATOR_INSTALL_REPO=sawrus/code-obfuscator bash
+curl -fsSL https://raw.githubusercontent.com/sawrus/code-obfuscator/main/install | bash
 ```
 
 Binaries are installed from GitHub
